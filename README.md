@@ -4,34 +4,59 @@ Programmatic Tool Calling for Claude Code via MCP.
 
 Claude Code on subscription plans lacks the Anthropic API's programmatic tool calling (PTC) feature, where Claude can write Python scripts that call multiple tools in a single execution. Without it, every tool invocation is a full model round-trip — intermediate results enter the context window, consuming tokens and adding latency.
 
-PTC-MCP fixes this. It's an MCP server that exposes a single `execute_program` tool. Claude writes a Python script, the server runs it with MCP tools injected as async functions, and only stdout comes back. Intermediate tool results stay in the Python runtime and never enter the conversation.
+PTC-MCP fixes this. It's an MCP server that exposes three tools:
+
+- **`list_callable_tools`** — Returns a JSON list of all available tool names. Use this to discover what's callable before writing a script.
+- **`inspect_tool`** — Returns the schema and description of a specific tool, including its `outputSchema` if the upstream server defines one.
+- **`execute_program`** — Runs a Python script with MCP tools injected as async functions. Only stdout comes back. Intermediate tool results stay in the Python runtime and never enter the conversation.
 
 ## How it works
 
-```
-Claude Code
-│
-│  Writes a Python script using namespaced tool names.
-│  Calls execute_program(code="...")
-│
-▼
-PTC-MCP Server
-│
-├── Tool Registry
-│     Connects to configured MCP servers at startup.
-│     Fetches their tools, applies allow/block filters,
-│     and registers each as a namespaced async function.
-│
-├── Execution Engine
-│     Wraps the script in an async function, injects
-│     the tool namespace, captures stdout, enforces
-│     timeout and output size limits.
-│
-└── Returns stdout with a status prefix.
-     Only this enters Claude Code's context.
+```mermaid
+flowchart TD
+    A[Claude Code] -->|list_callable_tools| B[PTC-MCP Server]
+    A -->|inspect_tool| B
+    A -->|execute_program| B
+
+    B --> C[Tool Registry]
+    B --> D[Execution Engine]
+
+    C -->|Connects at startup,\napplies allow/block filters| E[Downstream MCP Servers]
+    D -->|Runs script with tools\nas async functions| C
+    D -->|stdout only| A
 ```
 
-At startup, PTC-MCP connects to your configured MCP servers as a client, discovers their tools, and makes them callable as `mcp__<server>__<tool>()` async functions inside scripts. When Claude calls `execute_program`, the script runs in-process with those functions available. Tool calls proxy to the real MCP servers, results stay local, and only `print()` output goes back.
+At startup, PTC-MCP connects to your configured MCP servers as a client, discovers their tools, and makes them callable as `mcp__<server>__<tool>()` async functions inside scripts. Claude can call `list_callable_tools` to discover available tools, `inspect_tool` to understand a tool's schema, and then `execute_program` to run a script using those tools. Tool calls proxy to the real MCP servers, results stay local, and only `print()` output goes back.
+
+## Tools
+
+### `list_callable_tools`
+
+Takes no arguments. Returns a JSON array of sorted namespaced tool names:
+
+```json
+["mcp__financial_data__query_financials", "mcp__internal_apis__get_resource"]
+```
+
+### `inspect_tool`
+
+Takes a `tool_name` string. Returns the tool's schema, description, and `outputSchema` (if available):
+
+```json
+{
+  "name": "mcp__financial_data__query_financials",
+  "description": "Query financial statements for a given ticker.",
+  "inputSchema": { "type": "object", "properties": { "ticker": { "type": "string" } }, "required": ["ticker"] },
+  "outputSchema": null,
+  "note": "No output schema defined by the upstream server. Inspect the return value in your script."
+}
+```
+
+> **Note:** `outputSchema` is populated when the downstream MCP server defines one on its tools per the [MCP tool output schema specification](https://modelcontextprotocol.io/specification/draft/server/tools#output-schema). Downstream servers that declare output schemas improve discoverability — Claude can understand return types before writing a script. Without one, `inspect_tool` returns `null` for `outputSchema` and suggests inspecting return values at runtime instead.
+
+### `execute_program`
+
+Takes a `code` string. Runs the Python script with all registered tools available as async functions. Returns stdout prefixed with a status line.
 
 ## Example
 
