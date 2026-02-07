@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from ptc_mcp.config import Config, ToolsConfig
-from ptc_mcp.registry import ToolRegistry
+from ptc_mcp.registry import RegisteredTool, ToolRegistry
 
 
 class TestNamespacing:
@@ -92,3 +92,81 @@ class TestParseResult:
         ]
         parsed = ToolRegistry._parse_mcp_result(result)
         assert parsed == "line1\nline2"
+
+
+class TestListToolNames:
+    def _make_registry(self) -> ToolRegistry:
+        config = Config(tools=ToolsConfig())
+        return ToolRegistry(config)
+
+    def test_empty_registry(self):
+        reg = self._make_registry()
+        result = json.loads(reg.list_tool_names())
+        assert result == []
+
+    def test_with_tools(self):
+        reg = self._make_registry()
+        reg._tools["mcp__srv__beta"] = RegisteredTool(
+            name="mcp__srv__beta",
+            description="Beta tool",
+            parameters={"type": "object", "properties": {}},
+            output_schema=None,
+            handler=lambda **kw: None,
+        )
+        reg._tools["mcp__srv__alpha"] = RegisteredTool(
+            name="mcp__srv__alpha",
+            description="Alpha tool",
+            parameters={"type": "object", "properties": {}},
+            output_schema=None,
+            handler=lambda **kw: None,
+        )
+        result = json.loads(reg.list_tool_names())
+        assert result == ["mcp__srv__alpha", "mcp__srv__beta"]
+
+
+class TestInspectTool:
+    def _make_registry(self) -> ToolRegistry:
+        config = Config(tools=ToolsConfig())
+        return ToolRegistry(config)
+
+    def test_tool_found_without_output_schema(self):
+        reg = self._make_registry()
+        reg._tools["mcp__srv__mytool"] = RegisteredTool(
+            name="mcp__srv__mytool",
+            description="A test tool",
+            parameters={
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+            },
+            output_schema=None,
+            handler=lambda **kw: None,
+        )
+        result = json.loads(reg.inspect_tool("mcp__srv__mytool"))
+        assert result["name"] == "mcp__srv__mytool"
+        assert result["description"] == "A test tool"
+        assert result["inputSchema"]["properties"]["x"]["type"] == "integer"
+        assert result["outputSchema"] is None
+        assert "note" in result
+
+    def test_tool_found_with_output_schema(self):
+        reg = self._make_registry()
+        output_schema = {
+            "type": "object",
+            "properties": {"value": {"type": "number"}},
+        }
+        reg._tools["mcp__srv__mytool"] = RegisteredTool(
+            name="mcp__srv__mytool",
+            description="A tool with output schema",
+            parameters={"type": "object", "properties": {}},
+            output_schema=output_schema,
+            handler=lambda **kw: None,
+        )
+        result = json.loads(reg.inspect_tool("mcp__srv__mytool"))
+        assert result["outputSchema"] == output_schema
+        assert "note" not in result
+
+    def test_tool_not_found(self):
+        reg = self._make_registry()
+        result = reg.inspect_tool("mcp__nonexistent__foo")
+        assert result.startswith("[Tool not found]")

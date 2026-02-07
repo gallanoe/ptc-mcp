@@ -1,5 +1,6 @@
 """Integration tests: real ToolRegistry + mock_server + executor."""
 
+import json
 import sys
 
 import pytest
@@ -142,3 +143,36 @@ class TestIntegrationWithFilters:
             assert "mcp__mock_test__get_data" not in ns
 
         await _run_with_registry(config, check)
+
+
+class TestInspectToolIntegration:
+    async def test_inspect_known_tool(self):
+        async def check(reg):
+            result = json.loads(reg.inspect_tool("mcp__mock_test__add"))
+            assert result["name"] == "mcp__mock_test__add"
+            assert result["description"]  # non-empty
+            assert "properties" in result["inputSchema"]
+            # FastMCP generates an outputSchema from the return type annotation
+            assert "outputSchema" in result
+
+        await _run_with_registry(_make_config(), check)
+
+    async def test_inspect_unknown_tool(self):
+        async def check(reg):
+            result = reg.inspect_tool("mcp__nonexistent__foo")
+            assert result.startswith("[Tool not found]")
+
+        await _run_with_registry(_make_config(), check)
+
+
+class TestListCallableToolsIntegration:
+    async def test_lists_discovered_tools(self):
+        async def check(reg):
+            result = json.loads(reg.list_tool_names())
+            assert "mcp__mock_test__add" in result
+            assert "mcp__mock_test__greet" in result
+            assert "mcp__mock_test__get_data" in result
+            # Verify sorted order
+            assert result == sorted(result)
+
+        await _run_with_registry(_make_config(), check)

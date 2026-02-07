@@ -1,5 +1,4 @@
 # Programmatic Tool Calling MCP Server
-
 ## 1. Problem Statement
 
 Claude Code operates on subscription plans and does not have access to the Anthropic API's programmatic tool calling (PTC) feature. PTC enables Claude to write Python programs that call multiple tools within a single execution, returning only the final output to the model's context window. Without PTC, every tool invocation in Claude Code requires a full round-trip through the model — each intermediate result enters the context window, consuming tokens and adding latency.
@@ -23,43 +22,46 @@ Build an MCP server that provides PTC-equivalent functionality to Claude Code wi
 
 ## 3. Architecture
 
+```mermaid
+flowchart TD
+    CC["Claude Code (subscription)"]
+    CC -->|"execute_program(code='...')"| EX
+
+    subgraph EX["Programmatic Executor MCP Server"]
+        direction TB
+
+        subgraph REG["Tool Registry (built at startup)"]
+            direction TB
+            R1["mcp__financial_data__query_financials → bridge handler"]
+            R2["mcp__financial_data__stock_quote → bridge handler"]
+            R3["mcp__doc_retrieval__search_docs → bridge handler"]
+        end
+
+        subgraph ENG["Execution Engine"]
+            direction TB
+            E1["Receives Python code string"]
+            E2["Injects registry into namespace"]
+            E3["Wraps in async def, executes, captures stdout"]
+            E4["Tool calls dispatch to bridge handlers"]
+            E1 --> E2 --> E3 --> E4
+        end
+
+        REG --> ENG
+    end
+
+    ENG -->|"stdout only"| CC
+
+    E4 -->|"proxy call"| FD["financial-data MCP Server"]
+    E4 -->|"proxy call"| DR["document-retrieval MCP Server"]
+
+    FD -->|"result stays in runtime"| E4
+    DR -->|"result stays in runtime"| E4
 ```
-Claude Code (subscription)
-│
-│  Already discovers tools from all connected MCP servers.
-│  Already knows tool names, schemas, and descriptions.
-│
-│  Decides a task benefits from batched execution.
-│  Writes a Python script using namespaced tool names.
-│  Calls execute_program(code="...")
-│
-▼
-Programmatic Executor MCP Server
-│
-├── Tool Registry (built at startup)
-│     │
-│     │  Connects to configured MCP servers as a client.
-│     │  Fetches tool lists, applies allow/block filters.
-│     │  Registers each tool as a namespaced async handler.
-│     │
-│     ├── mcp__financial_data__query_financials  →  bridge handler
-│     ├── mcp__financial_data__stock_quote       →  bridge handler
-│     ├── mcp__doc_retrieval__search_docs        →  bridge handler
-│     └── ... (all filtered tools from all servers)
-│
-├── Execution Engine
-│     │
-│     │  Receives Python code string from execute_program.
-│     │  Injects registry into namespace.
-│     │  Wraps code in async def, executes, captures stdout.
-│     │
-│     └── Tool calls within the script dispatch to bridge
-│         handlers, which proxy to the real MCP servers.
-│         Results stay in the Python runtime.
-│
-└── Returns stdout with execution status prefix.
-     Only this output enters Claude Code's context.
-```
+
+**Key points:**
+- Claude Code already discovers tools from all connected MCP servers and knows their names, schemas, and descriptions.
+- It decides when a task benefits from batched execution and writes a Python script using namespaced tool names.
+- Only stdout with a status prefix is returned to Claude Code's context. Intermediate tool results never leave the Python runtime.
 
 ## 4. Configuration
 

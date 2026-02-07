@@ -83,22 +83,61 @@ def create_server() -> Server:
                     },
                     "required": ["code"],
                 },
-            )
+            ),
+            types.Tool(
+                name="inspect_tool",
+                description=(
+                    "Returns the schema and description of a tool available in "
+                    "execute_program. Includes outputSchema if the upstream MCP server "
+                    "defines one. Call this before writing a script if you need to "
+                    "understand a tool's return format."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {
+                            "type": "string",
+                            "description": (
+                                "Namespaced tool name "
+                                "(e.g., mcp__financial_data__query_financials)"
+                            ),
+                        }
+                    },
+                    "required": ["tool_name"],
+                },
+            ),
+            types.Tool(
+                name="list_callable_tools",
+                description=(
+                    "Returns a JSON list of all tool names available for use inside "
+                    "execute_program scripts. Use this to discover which tools are "
+                    "callable before writing a program."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
         ]
 
     @server.call_tool()
     async def handle_call_tool(
         name: str, arguments: dict[str, Any]
     ) -> list[types.TextContent]:
-        if name != "execute_program":
-            raise ValueError(f"Unknown tool: {name}")
-
         ctx = server.request_context
         registry: ToolRegistry = ctx.lifespan_context["registry"]
-        executor: ExecutionEngine = ctx.lifespan_context["executor"]
 
-        code = arguments.get("code", "")
-        result = await executor.run(code, registry.get_namespace())
+        if name == "execute_program":
+            executor: ExecutionEngine = ctx.lifespan_context["executor"]
+            code = arguments.get("code", "")
+            result = await executor.run(code, registry.get_namespace())
+        elif name == "inspect_tool":
+            tool_name = arguments.get("tool_name", "")
+            result = registry.inspect_tool(tool_name)
+        elif name == "list_callable_tools":
+            result = registry.list_tool_names()
+        else:
+            raise ValueError(f"Unknown tool: {name}")
 
         return [types.TextContent(type="text", text=result)]
 

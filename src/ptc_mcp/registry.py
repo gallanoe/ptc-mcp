@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from mcp import ClientSession
@@ -17,13 +18,22 @@ from .errors import ToolError
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class RegisteredTool:
+    name: str
+    description: str
+    parameters: dict  # inputSchema from upstream
+    output_schema: dict | None  # outputSchema from upstream (non-standard, may be None)
+    handler: Callable[..., Any]
+
+
 class ToolRegistry:
     """Manages connections to downstream MCP servers and exposes bridged tool handlers."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
         self._exit_stack = AsyncExitStack()
-        self._tools: dict[str, Callable[..., Any]] = {}
+        self._tools: dict[str, RegisteredTool] = {}
 
     async def initialize(self) -> None:
         """Connect to all configured MCP servers and register bridge handlers."""
@@ -39,7 +49,13 @@ class ToolRegistry:
                         logger.debug("Skipping blocked tool: %s", namespaced)
                         continue
                     handler = self._make_bridge_handler(session, tool.name, namespaced)
-                    self._tools[namespaced] = handler
+                    self._tools[namespaced] = RegisteredTool(
+                        name=namespaced,
+                        description=tool.description or "",
+                        parameters=tool.inputSchema if tool.inputSchema else {},
+                        output_schema=getattr(tool, "outputSchema", None),
+                        handler=handler,
+                    )
                 logger.info(
                     "Connected to '%s': %d tools registered",
                     server_config.name,
@@ -140,7 +156,35 @@ class ToolRegistry:
 
     def get_namespace(self) -> dict[str, Callable[..., Any]]:
         """Return tool namespace dict for injection into exec."""
-        return dict(self._tools)
+        return {name: rt.handler for name, rt in self._tools.items()}
+
+    def list_tool_names(self) -> str:
+        """Return a JSON array of all registered tool names."""
+        return json.dumps(sorted(self._tools.keys()))
+
+    def inspect_tool(self, tool_name: str) -> str:
+        """Return JSON schema and description for a registered tool."""
+        tool = self._tools.get(tool_name)
+        if not tool:
+            return f"[Tool not found] '{tool_name}' is not available in execute_program"
+
+        result: dict[str, Any] = {
+            "name": tool.name,
+            "description": tool.description,
+            "inputSchema": tool.parameters,
+        }
+
+        if tool.output_schema:
+            result["outputSchema"] = tool.output_schema
+        else:
+            result["outputSchema"] = None
+            result["note"] = (
+                "No output schema defined by the upstream server. "
+                "Inspect the return value in your script "
+                "(e.g., print(type(result), result[:1])) to determine the structure."
+            )
+
+        return json.dumps(result, indent=2)
 
     async def shutdown(self) -> None:
         """Close all downstream connections."""
