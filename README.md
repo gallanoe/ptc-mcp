@@ -1,4 +1,4 @@
-# PTC-MCP
+# Programmatic Tool Call MCP
 
 Programmatic Tool Calling for Claude Code via MCP.
 
