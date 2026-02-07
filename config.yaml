@@ -1,0 +1,29 @@
+# PTC-MCP Configuration
+# See SPEC.md for full configuration reference.
+
+# MCP servers to connect to as a client.
+# Each server's tools become available as async functions in execute_program.
+servers: []
+  # Example stdio server:
+  # - name: financial-data
+  #   transport: stdio
+  #   command: node
+  #   args: ["./financial-data-mcp/dist/index.js"]
+  #
+  # Example SSE server:
+  # - name: internal-apis
+  #   transport: sse
+  #   url: "http://localhost:8080/mcp"
+
+# Tool-level access control (uses namespaced names).
+# 'allow' and 'block' are mutually exclusive.
+tools: {}
+  # block:
+  #   - "mcp__internal_apis__delete_resource"
+  # allow:
+  #   - "mcp__financial_data__query_financials"
+
+# Execution constraints for execute_program.
+execution:
+  timeout_seconds: 120
+  max_output_bytes: 65536
