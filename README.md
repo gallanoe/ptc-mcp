@@ -21,8 +21,8 @@ flowchart TD
     B --> C[Tool Registry]
     B --> D[Execution Engine]
 
-    C -->|Connects at startup,\napplies allow/block filters| E[Downstream MCP Servers]
-    D -->|Runs script with tools\nas async functions| C
+    C -->|Connects at startup,<br/>applies allow/block filters| E[Downstream MCP Servers]
+    D -->|Runs script with tools<br/>as async functions| C
     D -->|stdout only| A
 ```
 
