@@ -30,5 +30,19 @@ def get_data(key: str) -> str:
     return json.dumps(result)
 
 
+@mcp.tool()
+def crash() -> str:
+    """Kill this server process (for reconnect tests)."""
+    import os
+
+    os._exit(1)
+
+
+@mcp.tool()
+def fail() -> str:
+    """Raise an error inside the tool (returned to the client as isError)."""
+    raise ValueError("mock failure")
+
+
 if __name__ == "__main__":
     mcp.run()

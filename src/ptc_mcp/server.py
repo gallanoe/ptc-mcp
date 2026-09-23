@@ -70,7 +70,12 @@ def create_server() -> Server:
                     "do not enter the conversation context. Use this when a task involves 3+ tool "
                     "calls, loops, filtering, aggregation, or conditional logic based on intermediate "
                     "results. For single tool calls, call the tool directly. All tool functions "
-                    "require `await`."
+                    "require `await` and take keyword arguments. A failed tool call raises "
+                    "`ToolError` (catch it to continue). Results are parsed JSON; server notes "
+                    "(e.g. empty-result warnings) appear under a `_notes` key. Call "
+                    "`emit(value)` to return a structured JSON result. Helpers: "
+                    "`list_callable_tools()`, `inspect_tool(tool_name=...)`, `server_status()`. "
+                    "Each program has a tool-call budget and a per-call timeout."
                 ),
                 inputSchema={
                     "type": "object",
@@ -138,13 +143,22 @@ def create_server() -> Server:
             # Failed runs (script error, timeout, sandbox failure) are MCP errors
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=outcome.text)],
+                structuredContent=outcome.structured,
                 isError=not outcome.ok,
             )
         elif name == "inspect_tool":
             tool_name = arguments.get("tool_name", "")
             result = registry.inspect_tool(tool_name)
         elif name == "list_callable_tools":
-            result = registry.list_tool_names()
+            content = [types.TextContent(type="text", text=registry.list_tool_names())]
+            down = registry.unavailable_servers()
+            if down:
+                detail = "; ".join(f"{n}: {e}" for n, e in sorted(down.items()))
+                content.append(types.TextContent(
+                    type="text",
+                    text=f"UNAVAILABLE SERVERS (their tools are not listed; reconnecting): {detail}",
+                ))
+            return content
         else:
             raise ValueError(f"Unknown tool: {name}")
 

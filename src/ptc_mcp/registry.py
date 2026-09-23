@@ -1,7 +1,15 @@
-"""Tool registry: connects to downstream MCP servers and creates bridge handlers."""
+"""Tool registry: connects to downstream MCP servers and creates bridge handlers.
+
+Each downstream server is owned by a supervisor task that opens the connection,
+registers the server's tools, and reconnects (with backoff) when the connection
+fails or a call reports it lost. The supervisor enters and exits the transport
+contexts in its own task, which anyio requires.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import fnmatch
 import json
 import logging
 from contextlib import AsyncExitStack
@@ -10,12 +18,19 @@ from typing import Any, Callable
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.types import TextContent
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED, TextContent
 
 from .config import Config, ServerConfig
 from .errors import ToolError
 
 logger = logging.getLogger(__name__)
+
+# Helpers injected into every script namespace alongside the bridged tools.
+INTROSPECTION_NAMES = ("list_callable_tools", "inspect_tool", "server_status")
+
+_CONNECT_TIMEOUT_SECONDS = 30
+_MAX_BACKOFF_SECONDS = 60
 
 
 @dataclass
@@ -23,8 +38,123 @@ class RegisteredTool:
     name: str
     description: str
     parameters: dict  # inputSchema from upstream
-    output_schema: dict | None  # outputSchema from upstream (non-standard, may be None)
+    output_schema: dict | None  # outputSchema from upstream (may be None)
     handler: Callable[..., Any]
+    server: str = ""
+
+
+class _ServerConnection:
+    """One downstream server: its live session (if any) and a supervisor task."""
+
+    def __init__(self, config: ServerConfig, on_connected: Callable[[_ServerConnection, list], None]):
+        self.config = config
+        self.session: ClientSession | None = None
+        self.error: str | None = None
+        self.tool_count = 0
+        self._on_connected = on_connected
+        self._first_attempt = asyncio.Event()
+        self._reconnect = asyncio.Event()
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def name(self) -> str:
+        return self.config.name
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._supervise(), name=f"ptc-server-{self.name}")
+
+    async def wait_first_attempt(self, timeout: float) -> None:
+        try:
+            await asyncio.wait_for(self._first_attempt.wait(), timeout)
+        except asyncio.TimeoutError:
+            if self.session is None and self.error is None:
+                self.error = f"no connection after {timeout:.0f}s"
+
+    def request_reconnect(self, reason: str) -> None:
+        if not self._reconnect.is_set():
+            logger.warning("Server '%s' connection lost (%s); reconnecting", self.name, reason)
+            self.session = None
+            self.error = f"reconnecting after: {reason}"
+            self._reconnect.set()
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+            except Exception:  # noqa: BLE001 - shutdown is best-effort
+                logger.debug("Server '%s' supervisor ended with an error", self.name, exc_info=True)
+
+    async def _supervise(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                async with AsyncExitStack() as stack:
+                    session = await asyncio.wait_for(
+                        _open_session(stack, self.config), _CONNECT_TIMEOUT_SECONDS
+                    )
+                    tools = (await session.list_tools()).tools
+                    self._reconnect.clear()
+                    self.session, self.error = session, None
+                    self._on_connected(self, tools)
+                    self._first_attempt.set()
+                    backoff = 1.0
+                    await _wait_any(self._reconnect, self._stop)
+            except Exception as e:  # noqa: BLE001 - any failure means "not connected"
+                self.error = f"{type(e).__name__}: {e}"
+                logger.warning("Server '%s' unavailable: %s", self.name, self.error)
+            self.session = None
+            self._first_attempt.set()
+            if self._stop.is_set():
+                break
+            # Back off before reconnecting; wake early on stop.
+            try:
+                await asyncio.wait_for(self._stop.wait(), backoff)
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+
+
+async def _wait_any(*events: asyncio.Event) -> None:
+    waiters = [asyncio.create_task(e.wait()) for e in events]
+    try:
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for w in waiters:
+            w.cancel()
+
+
+async def _open_session(stack: AsyncExitStack, server_config: ServerConfig) -> ClientSession:
+    """Establish a client connection to a downstream MCP server."""
+    transport = server_config.transport
+    if transport == "stdio":
+        params = StdioServerParameters(
+            command=server_config.command,
+            args=server_config.args,
+            env=server_config.env if server_config.env else None,
+        )
+        read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
+    elif transport == "sse":
+        from mcp.client.sse import sse_client
+
+        read_stream, write_stream = await stack.enter_async_context(
+            sse_client(server_config.url, headers=server_config.headers or None)
+        )
+    elif transport == "http":
+        from mcp.client.streamable_http import streamablehttp_client
+
+        read_stream, write_stream, _ = await stack.enter_async_context(
+            streamablehttp_client(server_config.url, headers=server_config.headers or None)
+        )
+    else:
+        raise ValueError(f"Unknown transport: {transport}")
+
+    session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+    await session.initialize()
+    return session
 
 
 class ToolRegistry:
@@ -32,73 +162,40 @@ class ToolRegistry:
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._exit_stack = AsyncExitStack()
         self._tools: dict[str, RegisteredTool] = {}
+        self._connections: dict[str, _ServerConnection] = {}
 
     async def initialize(self) -> None:
-        """Connect to all configured MCP servers and register bridge handlers."""
+        """Start a supervisor per server and wait for each first connection attempt."""
         for server_config in self._config.servers:
-            try:
-                session = await self._connect(server_config)
-                tools_result = await session.list_tools()
-                for tool in tools_result.tools:
-                    namespaced = self._make_namespaced_name(
-                        server_config.name, tool.name
-                    )
-                    if not self._is_allowed(namespaced):
-                        logger.debug("Skipping blocked tool: %s", namespaced)
-                        continue
-                    handler = self._make_bridge_handler(session, tool.name, namespaced)
-                    self._tools[namespaced] = RegisteredTool(
-                        name=namespaced,
-                        description=tool.description or "",
-                        parameters=tool.inputSchema if tool.inputSchema else {},
-                        output_schema=getattr(tool, "outputSchema", None),
-                        handler=handler,
-                    )
-                logger.info(
-                    "Connected to '%s': %d tools registered",
-                    server_config.name,
-                    sum(
-                        1
-                        for t in tools_result.tools
-                        if self._is_allowed(
-                            self._make_namespaced_name(server_config.name, t.name)
-                        )
-                    ),
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to connect to '%s', skipping",
-                    server_config.name,
-                    exc_info=True,
-                )
-
-    async def _connect(self, server_config: ServerConfig) -> ClientSession:
-        """Establish a client connection to a downstream MCP server."""
-        if server_config.transport == "stdio":
-            params = StdioServerParameters(
-                command=server_config.command,
-                args=server_config.args,
-                env=server_config.env if server_config.env else None,
-            )
-            read_stream, write_stream = await self._exit_stack.enter_async_context(
-                stdio_client(params)
-            )
-        elif server_config.transport == "sse":
-            from mcp.client.sse import sse_client
-
-            read_stream, write_stream = await self._exit_stack.enter_async_context(
-                sse_client(server_config.url)
-            )
-        else:
-            raise ValueError(f"Unknown transport: {server_config.transport}")
-
-        session = await self._exit_stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
+            conn = _ServerConnection(server_config, self._register_server_tools)
+            self._connections[server_config.name] = conn
+            conn.start()
+        await asyncio.gather(
+            *(c.wait_first_attempt(_CONNECT_TIMEOUT_SECONDS + 5) for c in self._connections.values())
         )
-        await session.initialize()
-        return session
+
+    def _register_server_tools(self, conn: _ServerConnection, tools: list) -> None:
+        """(Re)register one server's tools after it (re)connects."""
+        for name in [n for n, t in self._tools.items() if t.server == conn.name]:
+            del self._tools[name]
+        count = 0
+        for tool in tools:
+            namespaced = self._make_namespaced_name(conn.name, tool.name)
+            if not self._is_allowed(namespaced):
+                logger.debug("Skipping filtered tool: %s", namespaced)
+                continue
+            self._tools[namespaced] = RegisteredTool(
+                name=namespaced,
+                description=tool.description or "",
+                parameters=tool.inputSchema if tool.inputSchema else {},
+                output_schema=getattr(tool, "outputSchema", None),
+                handler=self._make_bridge_handler(conn, tool.name, namespaced),
+                server=conn.name,
+            )
+            count += 1
+        conn.tool_count = count
+        logger.info("Connected to '%s': %d tools registered", conn.name, count)
 
     @staticmethod
     def _make_namespaced_name(server_name: str, tool_name: str) -> str:
@@ -108,54 +205,99 @@ class ToolRegistry:
         return f"mcp__{safe_server}__{safe_tool}"
 
     def _is_allowed(self, namespaced: str) -> bool:
-        """Check if a namespaced tool name passes allow/block filters."""
+        """Check a namespaced tool name against allow/block lists (glob patterns)."""
         tools_config = self._config.tools
         if tools_config.allow:
-            return namespaced in tools_config.allow
+            return any(fnmatch.fnmatchcase(namespaced, p) for p in tools_config.allow)
         if tools_config.block:
-            return namespaced not in tools_config.block
+            return not any(fnmatch.fnmatchcase(namespaced, p) for p in tools_config.block)
         return True
 
     def _make_bridge_handler(
-        self, session: ClientSession, tool_name: str, namespaced: str
+        self, conn: _ServerConnection, tool_name: str, namespaced: str
     ) -> Callable[..., Any]:
         """Create an async closure that bridges calls to a downstream MCP tool."""
 
         async def handler(**kwargs: Any) -> Any:
+            session = conn.session
+            if session is None:
+                raise ToolError(
+                    f"'{namespaced}' unavailable: server '{conn.name}' is not connected"
+                    f" ({conn.error or 'connecting'})"
+                )
             try:
                 result = await session.call_tool(tool_name, kwargs)
-                return self._parse_mcp_result(result)
-            except ToolError:
-                raise
-            except Exception as e:
-                raise ToolError(f"'{namespaced}' failed: {e}") from e
+            except McpError as e:
+                if getattr(e.error, "code", None) != CONNECTION_CLOSED:
+                    # Protocol-level error from a live server (bad arguments, unknown tool)
+                    raise ToolError(f"'{namespaced}' failed: {e}") from e
+                conn.request_reconnect(str(e))
+                raise ToolError(
+                    f"'{namespaced}' failed: connection to '{conn.name}' closed; "
+                    "reconnecting — retry shortly"
+                ) from e
+            except Exception as e:  # noqa: BLE001 - transport failure: reconnect
+                conn.request_reconnect(f"{type(e).__name__}: {e}")
+                raise ToolError(
+                    f"'{namespaced}' failed: connection to '{conn.name}' lost ({e}); "
+                    "reconnecting — retry shortly"
+                ) from e
+            return self._parse_mcp_result(result, namespaced)
 
         handler.__name__ = namespaced
         handler.__qualname__ = namespaced
         return handler
 
     @staticmethod
-    def _parse_mcp_result(result: Any) -> Any:
-        """Extract usable Python data from an MCP tool result."""
-        texts = []
-        for content in result.content:
-            if isinstance(content, TextContent):
-                texts.append(content.text)
-            elif hasattr(content, "text"):
-                texts.append(content.text)
+    def _parse_mcp_result(result: Any, namespaced: str = "tool") -> Any:
+        """Extract usable Python data from an MCP tool result.
+
+        - ``isError`` results raise ``ToolError`` (never returned as data).
+        - ``structuredContent`` (a JSON object) is preferred when present. Text
+          items that are not the JSON rendering of it are notes from the server
+          (e.g. "EMPTY RESULT ..."); they are kept under a ``_notes`` key.
+        - Otherwise the text is JSON-decoded when possible, else returned as-is.
+        """
+        texts = [
+            c.text
+            for c in (getattr(result, "content", None) or [])
+            if isinstance(c, TextContent) or hasattr(c, "text")
+        ]
+
+        if getattr(result, "isError", False) is True:
+            detail = " ".join(t.strip() for t in texts if t.strip()) or "no details"
+            raise ToolError(f"'{namespaced}' returned an error: {detail}")
+
+        structured = getattr(result, "structuredContent", None)
+        if isinstance(structured, dict):
+            if any(_is_json_of(t, structured) for t in texts) or set(structured) != {"result"}:
+                # A genuine object result (the text is its rendering, or prose).
+                notes = [t for t in texts if not _is_json_of(t, structured)]
+                return _attach_notes(dict(structured), notes)
+            # FastMCP wraps non-object returns as {"result": value}; unwrap it.
+            value = structured["result"]
+            notes = [t for t in texts if t != value and not _is_json_of(t, value)]
+            if isinstance(value, str):
+                value = _json_or_text(value)
+            return _attach_notes(value, notes)
 
         if not texts:
             return None
+        if len(texts) == 1:
+            return _json_or_text(texts[0])
 
-        combined = "\n".join(texts) if len(texts) > 1 else texts[0]
-
-        try:
-            return json.loads(combined)
-        except (json.JSONDecodeError, TypeError):
-            return combined
+        parsed, notes = [], []
+        for t in texts:
+            try:
+                parsed.append(json.loads(t))
+            except (json.JSONDecodeError, TypeError):
+                notes.append(t)
+        if len(parsed) == 1 and notes:
+            return _attach_notes(parsed[0], notes)
+        return _json_or_text("\n".join(texts))
 
     def get_namespace(self) -> dict[str, Callable[..., Any]]:
-        """Return tool namespace dict for injection into exec."""
+        """Return tool namespace dict for injection into a script."""
         ns: dict[str, Callable[..., Any]] = {
             name: rt.handler for name, rt in self._tools.items()
         }
@@ -172,9 +314,31 @@ class ToolRegistry:
             except (json.JSONDecodeError, TypeError):
                 return raw
 
+        async def server_status() -> dict[str, dict[str, Any]]:
+            """Connection state of every configured downstream server."""
+            return self.server_status()
+
         ns["list_callable_tools"] = list_callable_tools
         ns["inspect_tool"] = _inspect_tool_impl
+        ns["server_status"] = server_status
         return ns
+
+    def server_status(self) -> dict[str, dict[str, Any]]:
+        return {
+            name: {
+                "connected": conn.session is not None,
+                "tools": conn.tool_count if conn.session is not None else 0,
+                "error": None if conn.session is not None else conn.error,
+            }
+            for name, conn in self._connections.items()
+        }
+
+    def unavailable_servers(self) -> dict[str, str]:
+        return {
+            name: (conn.error or "not connected")
+            for name, conn in self._connections.items()
+            if conn.session is None
+        }
 
     def list_tool_names(self) -> str:
         """Return a JSON array of all registered tool names."""
@@ -205,5 +369,29 @@ class ToolRegistry:
         return json.dumps(result, indent=2)
 
     async def shutdown(self) -> None:
-        """Close all downstream connections."""
-        await self._exit_stack.aclose()
+        """Stop every server supervisor (closing its connection)."""
+        await asyncio.gather(*(c.stop() for c in self._connections.values()))
+
+
+def _is_json_of(text: str, value: Any) -> bool:
+    try:
+        return json.loads(text) == value
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
+def _attach_notes(value: Any, notes: list[str]) -> Any:
+    """Keep server notes next to the data: a ``_notes`` key on objects, or a
+    ``{"data": ..., "_notes": [...]}`` wrapper for anything else."""
+    if not notes:
+        return value
+    if isinstance(value, dict):
+        return {**value, "_notes": notes}
+    return {"data": value, "_notes": notes}
+
+
+def _json_or_text(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text

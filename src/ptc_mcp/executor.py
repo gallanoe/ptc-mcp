@@ -18,12 +18,14 @@ import logging
 import os
 import signal
 import tempfile
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from importlib import resources
 from typing import Any, Callable
 
 from . import sandbox
 from .config import ExecutionConfig
+from .registry import INTROSPECTION_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,23 @@ class _ProtocolError(Exception):
 class ExecutionOutcome:
     ok: bool
     text: str
+    # {"ok", "output", "result", "tool_calls": [...]} — the MCP structuredContent
+    structured: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _CallRecord:
+    tool: str
+    args: str
+    ok: bool
+    ms: int
+    error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"tool": self.tool, "args": self.args, "ok": self.ok, "ms": self.ms}
+        if self.error is not None:
+            d["error"] = self.error
+        return d
 
 
 class ExecutionEngine:
@@ -65,12 +84,14 @@ class ExecutionEngine:
     ) -> ExecutionOutcome:
         """Execute code; ``ok`` is False for script errors, timeouts, and sandbox failures."""
         timeout = self._config.timeout_seconds
+        records: list[_CallRecord] = []
+        started = time.monotonic()
         scratch = tempfile.mkdtemp(prefix="ptc-run-")
         try:
             try:
                 argv = sandbox.build_command(self._config.sandbox, _RUNNER_SOURCE, scratch)
             except (RuntimeError, ValueError) as e:
-                return _failure(f"SandboxError: {e}")
+                return self._compose(False, f"SandboxError: {e}", "", None, records, started)
 
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -85,39 +106,77 @@ class ExecutionEngine:
             stderr_task = asyncio.create_task(_read_capped(proc.stderr, _MAX_STDERR_BYTES))
             try:
                 done = await asyncio.wait_for(
-                    self._session(proc, code, tool_namespace), timeout=timeout
+                    self._session(proc, code, tool_namespace, records), timeout=timeout
                 )
             except asyncio.TimeoutError:
-                return _failure(f"TimeoutError: Execution exceeded {timeout}s limit")
+                return self._compose(
+                    False, f"TimeoutError: Execution exceeded {timeout}s limit", "", None,
+                    records, started,
+                )
             except _ProtocolError as e:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(proc.wait(), timeout=2)
                 stderr = await _drain(stderr_task)
-                return _failure(_describe_crash(proc, str(e), stderr))
+                return self._compose(
+                    False, _describe_crash(proc, str(e), stderr), "", None, records, started
+                )
             finally:
                 await _kill(proc)
                 stderr_task.cancel()
 
-            if done.get("ok"):
-                output = done.get("output") or ""
-                return ExecutionOutcome(
-                    True, f"{SUCCESS_HEADER}\n{output if output.strip() else '(no output)'}"
-                )
-            text = done.get("error") or "unknown error"
-            output = done.get("output") or ""
-            if output.strip():
-                text = f"{text.rstrip()}\n\n--- output before the error ---\n{output}"
-            return _failure(text)
+            result = done.get("result") if done.get("has_result") else None
+            has_result = bool(done.get("has_result"))
+            return self._compose(
+                bool(done.get("ok")), done.get("error") or "unknown error",
+                done.get("output") or "", (result,) if has_result else None, records, started,
+            )
         finally:
             sandbox.remove_scratch(scratch)
+
+    def _compose(
+        self,
+        ok: bool,
+        error: str,
+        output: str,
+        result: tuple[Any] | None,
+        records: list[_CallRecord],
+        started: float,
+    ) -> ExecutionOutcome:
+        """Build the text (for the model) and structured (for machines) outcome."""
+        if ok:
+            text = f"{SUCCESS_HEADER}\n{output if output.strip() else '(no output)'}"
+            if result is not None:
+                text = f"{text.rstrip()}\n--- result ---\n{json.dumps(result[0])}"
+        else:
+            text = f"{FAILURE_HEADER}\n{error}"
+            if output.strip():
+                text = f"{text.rstrip()}\n\n--- output before the error ---\n{output}"
+        if self._config.trace == "summary" and records:
+            text = f"{text.rstrip()}\n{_trace_summary(records, time.monotonic() - started)}"
+        logger.info(
+            "execute_program: ok=%s tool_calls=%d failed=%d",
+            ok, len(records), sum(1 for r in records if not r.ok),
+        )
+        structured = {
+            "ok": ok,
+            "output": output,
+            "result": result[0] if result is not None else None,
+            "error": None if ok else error,
+            "tool_calls": [r.as_dict() for r in records],
+        }
+        return ExecutionOutcome(ok, text, structured)
 
     async def _session(
         self,
         proc: asyncio.subprocess.Process,
         code: str,
         tool_namespace: dict[str, Callable[..., Any]],
+        records: list[_CallRecord],
     ) -> dict[str, Any]:
         """Drive one child run until it reports ``done``."""
+        cfg = self._config
+        slots = asyncio.Semaphore(cfg.max_concurrent_calls)
+        budget = {"used": 0}
         assert proc.stdin is not None and proc.stdout is not None
         write_lock = asyncio.Lock()
 
@@ -146,19 +205,38 @@ class ExecutionEngine:
         async def handle_call(msg: dict[str, Any]) -> None:
             call_id = msg.get("id")
             name = msg.get("tool")
+            args = msg.get("args") if isinstance(msg.get("args"), dict) else {}
             handler = tool_namespace.get(name) if isinstance(name, str) else None
+            counted = handler is not None and name not in INTROSPECTION_NAMES
+            t0 = time.monotonic()
+            reply: dict[str, Any]
             if handler is None:
                 reply = {"type": "result", "id": call_id, "ok": False,
                          "error": f"unknown tool {name!r}"}
+            elif counted and budget["used"] >= cfg.max_tool_calls:
+                reply = {"type": "result", "id": call_id, "ok": False,
+                         "error": f"tool-call budget exhausted (max_tool_calls={cfg.max_tool_calls})"}
             else:
-                args = msg.get("args") or {}
+                if counted:
+                    budget["used"] += 1
                 try:
-                    value = await handler(**args)
+                    async with slots:
+                        value = await asyncio.wait_for(
+                            handler(**args), timeout=cfg.tool_call_timeout_seconds
+                        )
                     reply = {"type": "result", "id": call_id, "ok": True,
                              "value": _jsonable(value)}
+                except asyncio.TimeoutError:
+                    reply = {"type": "result", "id": call_id, "ok": False,
+                             "error": f"'{name}' timed out after {cfg.tool_call_timeout_seconds}s"}
                 except Exception as e:  # noqa: BLE001 - surface every failure to the script
                     reply = {"type": "result", "id": call_id, "ok": False,
                              "error": str(e) or type(e).__name__}
+            if counted or handler is None:
+                records.append(_CallRecord(
+                    tool=str(name), args=_short(args), ok=bool(reply["ok"]),
+                    ms=round((time.monotonic() - t0) * 1000), error=reply.get("error"),
+                ))
             with contextlib.suppress(BrokenPipeError, ConnectionResetError):
                 await send(reply)
 
@@ -188,8 +266,25 @@ class ExecutionEngine:
                 task.cancel()
 
 
-def _failure(text: str) -> ExecutionOutcome:
-    return ExecutionOutcome(False, f"{FAILURE_HEADER}\n{text}")
+def _short(args: dict[str, Any], limit: int = 200) -> str:
+    try:
+        s = json.dumps(args, sort_keys=True)
+    except (TypeError, ValueError):
+        s = repr(args)
+    return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def _trace_summary(records: list[_CallRecord], elapsed: float, max_failures: int = 5) -> str:
+    failed = [r for r in records if not r.ok]
+    line = f"[tool calls: {len(records)}"
+    if failed:
+        line += f", {len(failed)} failed"
+    line += f"; {elapsed:.1f}s]"
+    for r in failed[:max_failures]:
+        line += f"\n  failed: {r.tool}: {r.error}"
+    if len(failed) > max_failures:
+        line += f"\n  ... {len(failed) - max_failures} more failures"
+    return line
 
 
 def _jsonable(value: Any) -> Any:

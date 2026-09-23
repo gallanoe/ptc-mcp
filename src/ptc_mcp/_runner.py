@@ -8,7 +8,11 @@ Protocol (newline-delimited JSON):
   parent -> child  {"type": "start", "code": str, "tools": [str], "limits": {...}}
   child  -> parent {"type": "call", "id": int, "tool": str, "args": {...}}
   parent -> child  {"type": "result", "id": int, "ok": bool, "value": ..., "error": str}
-  child  -> parent {"type": "done", "ok": bool, "output": str, "error": str | null}
+  child  -> parent {"type": "done", "ok": bool, "output": str, "error": str | null,
+                    "has_result": bool, "result": ...}
+
+Scripts can call ``emit(value)`` to return a JSON-serializable structured
+result alongside printed output (the last call wins).
 
 The RPC pipes are moved off fds 0/1 before any user code runs, and fds 0/1 are
 pointed at /dev/null, so nothing the script prints or writes can corrupt the
@@ -171,12 +175,26 @@ async def _main(in_fd, out_fd):
     limits = start.get("limits", {})
     _set_limits(limits)
 
-    namespace = {"__name__": "__main__", "ToolError": ToolError}
+    max_output = int(limits.get("max_output_bytes", 65536))
+    emitted = {"set": False, "value": None}
+
+    def emit(value):
+        """Return ``value`` (JSON-serializable) as the program's structured result."""
+        try:
+            data = json.dumps(value)
+        except (TypeError, ValueError) as e:
+            raise TypeError(f"emit() value must be JSON-serializable: {e}") from None
+        size = len(data.encode("utf-8"))
+        if size > max_output:
+            raise ValueError(f"emit() value is {size} bytes; the limit is {max_output}")
+        emitted["set"], emitted["value"] = True, json.loads(data)
+
+    namespace = {"__name__": "__main__", "ToolError": ToolError, "emit": emit}
     for name in start.get("tools", []):
         namespace[name] = _make_stub(rpc, name)
 
     results_task = asyncio.create_task(rpc.dispatch_results())
-    out = _CappedWriter(int(limits.get("max_output_bytes", 65536)))
+    out = _CappedWriter(max_output)
     ok, error = True, None
     try:
         linecache.cache[PROGRAM] = (len(code), None, code.splitlines(True), PROGRAM)
@@ -193,7 +211,10 @@ async def _main(in_fd, out_fd):
     output = out.getvalue()
     if out.truncated:
         output += "\n... (truncated)"
-    rpc.send({"type": "done", "ok": ok, "output": output, "error": error})
+    rpc.send({
+        "type": "done", "ok": ok, "output": output, "error": error,
+        "has_result": emitted["set"], "result": emitted["value"],
+    })
     # Exit immediately: tasks the script left running must not delay or
     # outlive the run (asyncio.run would wait on their cancellation).
     os._exit(0)

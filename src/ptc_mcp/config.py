@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
+
+TRANSPORTS = ("stdio", "sse", "http")
+SANDBOX_MODES = ("seatbelt", "none")
+TRACE_MODES = ("summary", "off")
 
 
 @dataclass
@@ -14,16 +20,18 @@ class ServerConfig:
     """Configuration for a downstream MCP server."""
 
     name: str
-    transport: str  # "stdio" or "sse"
+    transport: str  # "stdio", "sse", or "http" (streamable HTTP)
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class ToolsConfig:
-    """Tool-level access control."""
+    """Tool-level access control. Entries are namespaced names or glob patterns
+    (e.g. ``mcp__fmp__*``)."""
 
     allow: list[str] = field(default_factory=list)
     block: list[str] = field(default_factory=list)
@@ -38,6 +46,12 @@ class ExecutionConfig:
     # "seatbelt": run scripts under sandbox-exec (macOS). "none": child process
     # without an OS sandbox (explicit opt-in, e.g. for Linux CI).
     sandbox: str = "seatbelt"
+    # Per-program tool-call budget (introspection helpers are not counted).
+    max_tool_calls: int = 100
+    max_concurrent_calls: int = 8
+    tool_call_timeout_seconds: float = 60
+    # "summary": append a one-line call count (plus any failures) to the output.
+    trace: str = "summary"
 
 
 @dataclass
@@ -47,6 +61,32 @@ class Config:
     servers: list[ServerConfig] = field(default_factory=list)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+
+
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def expand_env(value: Any, where: str) -> Any:
+    """Replace ``${VAR}`` / ``${VAR:-default}`` in strings (recursively).
+
+    Lets secrets live in the environment instead of the config file. An unset
+    variable without a default is a config error, never an empty string.
+    """
+    if isinstance(value, str):
+        def sub(m: re.Match[str]) -> str:
+            name, default = m.group(1), m.group(2)
+            if name in os.environ:
+                return os.environ[name]
+            if default is not None:
+                return default
+            raise ValueError(f"{where}: environment variable ${{{name}}} is not set")
+
+        return _ENV_REF.sub(sub, value)
+    if isinstance(value, list):
+        return [expand_env(v, where) for v in value]
+    if isinstance(value, dict):
+        return {k: expand_env(v, where) for k, v in value.items()}
+    return value
 
 
 def load_config(path: str | Path) -> Config:
@@ -60,24 +100,30 @@ def load_config(path: str | Path) -> Config:
 
     servers = []
     for entry in raw.get("servers", []) or []:
+        name = entry["name"]
+        where = f"Server '{name}'"
         transport = entry.get("transport", "stdio")
+        if transport not in TRANSPORTS:
+            raise ValueError(f"{where}: unknown transport {transport!r} (expected one of {TRANSPORTS})")
         sc = ServerConfig(
-            name=entry["name"],
+            name=name,
             transport=transport,
-            command=entry.get("command"),
-            args=entry.get("args", []),
-            env=entry.get("env", {}),
-            url=entry.get("url"),
+            command=expand_env(entry.get("command"), where),
+            args=[str(a) for a in expand_env(entry.get("args", []) or [], where)],
+            env={k: str(v) for k, v in expand_env(entry.get("env", {}) or {}, where).items()},
+            url=expand_env(entry.get("url"), where),
+            headers={k: str(v) for k, v in expand_env(entry.get("headers", {}) or {}, where).items()},
         )
         if transport == "stdio" and not sc.command:
-            raise ValueError(
-                f"Server '{sc.name}': stdio transport requires 'command'"
-            )
-        if transport == "sse" and not sc.url:
-            raise ValueError(
-                f"Server '{sc.name}': sse transport requires 'url'"
-            )
+            raise ValueError(f"{where}: stdio transport requires 'command'")
+        if transport in ("sse", "http") and not sc.url:
+            raise ValueError(f"{where}: {transport} transport requires 'url'")
         servers.append(sc)
+
+    names = [s.name for s in servers]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"duplicate server names: {dupes}")
 
     tools_raw = raw.get("tools", {}) or {}
     tools = ToolsConfig(
@@ -88,14 +134,26 @@ def load_config(path: str | Path) -> Config:
         raise ValueError("'allow' and 'block' are mutually exclusive in tools config")
 
     exec_raw = raw.get("execution", {}) or {}
+    defaults = ExecutionConfig()
     execution = ExecutionConfig(
-        timeout_seconds=exec_raw.get("timeout_seconds", 120),
-        max_output_bytes=exec_raw.get("max_output_bytes", 65536),
-        sandbox=exec_raw.get("sandbox", "seatbelt"),
+        timeout_seconds=exec_raw.get("timeout_seconds", defaults.timeout_seconds),
+        max_output_bytes=exec_raw.get("max_output_bytes", defaults.max_output_bytes),
+        sandbox=exec_raw.get("sandbox", defaults.sandbox),
+        max_tool_calls=exec_raw.get("max_tool_calls", defaults.max_tool_calls),
+        max_concurrent_calls=exec_raw.get("max_concurrent_calls", defaults.max_concurrent_calls),
+        tool_call_timeout_seconds=exec_raw.get(
+            "tool_call_timeout_seconds", defaults.tool_call_timeout_seconds
+        ),
+        trace=exec_raw.get("trace", defaults.trace),
     )
-    if execution.sandbox not in ("seatbelt", "none"):
+    if execution.sandbox not in SANDBOX_MODES:
         raise ValueError(
             f"execution.sandbox must be 'seatbelt' or 'none', got {execution.sandbox!r}"
         )
+    if execution.trace not in TRACE_MODES:
+        raise ValueError(f"execution.trace must be one of {TRACE_MODES}, got {execution.trace!r}")
+    for key in ("max_tool_calls", "max_concurrent_calls", "tool_call_timeout_seconds"):
+        if not getattr(execution, key) > 0:
+            raise ValueError(f"execution.{key} must be > 0")
 
     return Config(servers=servers, tools=tools, execution=execution)
