@@ -18,8 +18,8 @@ from ptc_mcp.registry import ToolRegistry
 def _result(*texts, structured=None, is_error=False):
     return SimpleNamespace(
         content=[TextContent(type="text", text=t) for t in texts],
-        structuredContent=structured,
-        isError=is_error,
+        structured_content=structured,
+        is_error=is_error,
     )
 
 
@@ -283,8 +283,18 @@ async def _with_registry(config, fn):
 class TestServerLifecycle:
     async def test_tool_is_error_becomes_tool_error(self):
         async def check(reg):
-            with pytest.raises(ToolError, match="mock failure"):
+            with pytest.raises(ToolError, match="returned an error: .*mock failure"):
                 await reg.get_namespace()["mcp__mock_test__fail"]()
+
+        await _with_registry(Config(servers=[_mock_server()]), check)
+
+    async def test_unexpected_server_exception_is_tool_error_without_reconnect(self):
+        async def check(reg):
+            ns = reg.get_namespace()
+            with pytest.raises(ToolError, match="mcp__mock_test__boom' returned an error: Error executing tool boom"):
+                await ns["mcp__mock_test__boom"]()
+            assert reg.server_status()["mock-test"]["connected"] is True
+            assert await ns["mcp__mock_test__add"](a=1, b=1) == {"result": 2}
 
         await _with_registry(Config(servers=[_mock_server()]), check)
 

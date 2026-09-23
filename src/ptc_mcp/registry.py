@@ -16,9 +16,9 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.shared.exceptions import McpError
+from mcp import Client
+from mcp.client.stdio import StdioServerParameters
+from mcp.shared.exceptions import MCPError
 from mcp.types import CONNECTION_CLOSED, TextContent
 
 from .config import Config, ServerConfig
@@ -48,7 +48,7 @@ class _ServerConnection:
 
     def __init__(self, config: ServerConfig, on_connected: Callable[[_ServerConnection, list], None]):
         self.config = config
-        self.session: ClientSession | None = None
+        self.session: Client | None = None
         self.error: str | None = None
         self.tool_count = 0
         self._on_connected = on_connected
@@ -94,9 +94,10 @@ class _ServerConnection:
             try:
                 async with AsyncExitStack() as stack:
                     session = await asyncio.wait_for(
-                        _open_session(stack, self.config), _CONNECT_TIMEOUT_SECONDS
+                        stack.enter_async_context(_make_client(self.config)),
+                        _CONNECT_TIMEOUT_SECONDS,
                     )
-                    tools = (await session.list_tools()).tools
+                    tools = await _list_all_tools(session)
                     self._reconnect.clear()
                     self.session, self.error = session, None
                     self._on_connected(self, tools)
@@ -127,34 +128,39 @@ async def _wait_any(*events: asyncio.Event) -> None:
             w.cancel()
 
 
-async def _open_session(stack: AsyncExitStack, server_config: ServerConfig) -> ClientSession:
-    """Establish a client connection to a downstream MCP server."""
+def _make_client(server_config: ServerConfig) -> Client:
+    """A v2 ``Client`` for a downstream server (protocol negotiated automatically:
+    2026-era discovery, falling back to the legacy initialize handshake)."""
     transport = server_config.transport
     if transport == "stdio":
-        params = StdioServerParameters(
+        return Client(StdioServerParameters(
             command=server_config.command,
             args=server_config.args,
             env=server_config.env if server_config.env else None,
-        )
-        read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
-    elif transport == "sse":
+        ))
+    if transport == "http":
+        from mcp.client.streamable_http import streamable_http_client
+        from mcp.shared._httpx_utils import create_mcp_http_client
+
+        http = create_mcp_http_client(headers=server_config.headers or None)
+        return Client(streamable_http_client(server_config.url, http_client=http))
+    if transport == "sse":
         from mcp.client.sse import sse_client
 
-        read_stream, write_stream = await stack.enter_async_context(
-            sse_client(server_config.url, headers=server_config.headers or None)
-        )
-    elif transport == "http":
-        from mcp.client.streamable_http import streamablehttp_client
+        return Client(sse_client(server_config.url, headers=server_config.headers or None))
+    raise ValueError(f"Unknown transport: {transport}")
 
-        read_stream, write_stream, _ = await stack.enter_async_context(
-            streamablehttp_client(server_config.url, headers=server_config.headers or None)
-        )
-    else:
-        raise ValueError(f"Unknown transport: {transport}")
 
-    session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-    await session.initialize()
-    return session
+async def _list_all_tools(client: Client) -> list:
+    """Every tool the server offers, following pagination cursors."""
+    tools: list = []
+    cursor: str | None = None
+    while True:
+        page = await client.list_tools(cursor=cursor)
+        tools.extend(page.tools)
+        cursor = page.next_cursor
+        if not cursor:
+            return tools
 
 
 class ToolRegistry:
@@ -188,8 +194,8 @@ class ToolRegistry:
             self._tools[namespaced] = RegisteredTool(
                 name=namespaced,
                 description=tool.description or "",
-                parameters=tool.inputSchema if tool.inputSchema else {},
-                output_schema=getattr(tool, "outputSchema", None),
+                parameters=tool.input_schema if tool.input_schema else {},
+                output_schema=tool.output_schema,
                 handler=self._make_bridge_handler(conn, tool.name, namespaced),
                 server=conn.name,
             )
@@ -227,8 +233,8 @@ class ToolRegistry:
                 )
             try:
                 result = await session.call_tool(tool_name, kwargs)
-            except McpError as e:
-                if getattr(e.error, "code", None) != CONNECTION_CLOSED:
+            except MCPError as e:
+                if e.code != CONNECTION_CLOSED:
                     # Protocol-level error from a live server (bad arguments, unknown tool)
                     raise ToolError(f"'{namespaced}' failed: {e}") from e
                 conn.request_reconnect(str(e))
@@ -252,8 +258,8 @@ class ToolRegistry:
     def _parse_mcp_result(result: Any, namespaced: str = "tool") -> Any:
         """Extract usable Python data from an MCP tool result.
 
-        - ``isError`` results raise ``ToolError`` (never returned as data).
-        - ``structuredContent`` (a JSON object) is preferred when present. Text
+        - ``is_error`` results raise ``ToolError`` (never returned as data).
+        - ``structured_content`` (a JSON object) is preferred when present. Text
           items that are not the JSON rendering of it are notes from the server
           (e.g. "EMPTY RESULT ..."); they are kept under a ``_notes`` key.
         - Otherwise the text is JSON-decoded when possible, else returned as-is.
@@ -264,11 +270,11 @@ class ToolRegistry:
             if isinstance(c, TextContent) or hasattr(c, "text")
         ]
 
-        if getattr(result, "isError", False) is True:
+        if getattr(result, "is_error", False) is True:
             detail = " ".join(t.strip() for t in texts if t.strip()) or "no details"
             raise ToolError(f"'{namespaced}' returned an error: {detail}")
 
-        structured = getattr(result, "structuredContent", None)
+        structured = getattr(result, "structured_content", None)
         if isinstance(structured, dict):
             if any(_is_json_of(t, structured) for t in texts) or set(structured) != {"result"}:
                 # A genuine object result (the text is its rendering, or prose).

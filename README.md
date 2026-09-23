@@ -56,7 +56,7 @@ Takes a `tool_name` string. Returns the tool's schema, description, and `outputS
 
 ### `execute_program`
 
-Takes a `code` string. Runs the Python script with all registered tools available as async functions. Returns stdout prefixed with a status line.
+Takes a `code` string. Runs the Python script in a sandboxed child process with all registered tools available as async functions. Returns stdout prefixed with a status line (plus any `emit()` result and a tool-call summary), and structured content with `ok`, `output`, `result`, `error`, and `tool_calls`. Failed runs set MCP `isError`.
 
 ## Example
 
@@ -94,7 +94,7 @@ uv venv && uv pip install -e ".[dev]"
 
 ## Configuration
 
-Copy `config.example.yaml` to `config.yaml` (gitignored, since it usually holds API keys) and edit it, or set `PTC_MCP_CONFIG` to point elsewhere:
+Copy `config.example.yaml` to `config.yaml` (gitignored) and edit it, or set `PTC_MCP_CONFIG` to point elsewhere. Keep secrets out of the file with `${VAR}` references:
 
 ```yaml
 servers:
@@ -102,24 +102,63 @@ servers:
     transport: stdio
     command: node
     args: ["./financial-data-mcp/dist/index.js"]
+    env:
+      API_KEY: ${FINANCIAL_DATA_API_KEY}     # from ptc-mcp's environment
 
   - name: internal-apis
-    transport: sse
-    url: "http://localhost:8080/mcp"
+    transport: http                          # streamable HTTP ("sse" also supported)
+    url: "https://internal.example.com/mcp"
+    headers:
+      Authorization: "Bearer ${INTERNAL_TOKEN}"
 
 tools:
-  block:
-    - "mcp__internal_apis__delete_resource"
+  allow:                                     # glob patterns; or use `block`
+    - "mcp__financial_data__*"
 
 execution:
   timeout_seconds: 120
   max_output_bytes: 65536
-  sandbox: seatbelt   # or "none"
+  sandbox: seatbelt            # or "none"
+  max_tool_calls: 100          # per program (introspection helpers not counted)
+  max_concurrent_calls: 8
+  tool_call_timeout_seconds: 60
+  trace: summary               # or "off"
 ```
 
-- **servers** — MCP servers to bridge. Supports `stdio` and `sse` transports.
-- **tools.allow / tools.block** — Whitelist or blacklist namespaced tool names (mutually exclusive). Omit both to allow everything.
-- **execution** — Timeout and output size limits for `execute_program`, and the sandbox mode (below).
+- **servers** — MCP servers to bridge: `stdio`, `http` (streamable HTTP), or `sse`.
+  `command`, `args`, `env`, `url`, and `headers` expand `${VAR}` and
+  `${VAR:-default}`; an unset variable without a default is a config error.
+- **tools.allow / tools.block** — namespaced tool names or glob patterns
+  (mutually exclusive). Omit both to allow everything; prefer an allowlist.
+- **execution** — time/output limits, the sandbox mode (below), and the
+  per-program tool-call budget.
+
+## Results, errors, and budgets
+
+Inside a program:
+
+- Tool results are parsed JSON. When the server returns structured content it
+  is used directly; any extra text the server sent (e.g. "EMPTY RESULT …"
+  warnings) is kept under a `_notes` key instead of being lost or turning the
+  result into a string.
+- A tool that fails (an `is_error` result, a protocol error, a timeout, a lost
+  connection, or an exhausted budget) raises `ToolError`; catch it to continue.
+- `emit(value)` returns a JSON-serializable structured result (last call wins).
+  It appears after `--- result ---` in the output and as `result` in the
+  `execute_program` structured content.
+- Helpers: `list_callable_tools()`, `inspect_tool(tool_name=...)`, and
+  `server_status()` (connection state of each downstream server).
+
+Each program may make at most `max_tool_calls` calls, `max_concurrent_calls`
+at a time, each bounded by `tool_call_timeout_seconds`. With `trace: summary`
+the output ends with a line such as `[tool calls: 12, 1 failed; 2.3s]` plus the
+failures; the structured content always lists every call (tool, arguments, ok,
+duration, error).
+
+Each downstream server is supervised: if it fails to start or its connection
+drops, ptc-mcp keeps reconnecting with backoff. Its tools disappear from
+`list_callable_tools` (which then names the unavailable servers) and reappear
+once it is back.
 
 ## Sandbox
 
@@ -173,4 +212,4 @@ The server communicates over stdio (JSON-RPC). Add it to your Claude Code MCP se
 uv run pytest tests/ -v
 ```
 
-Tests include unit tests for config parsing, the execution engine, registry filtering/namespacing, and end-to-end integration tests that spin up a real mock MCP server.
+Tests include unit tests for config parsing, the execution engine, registry filtering/namespacing, sandbox isolation (escape attempts, timeouts, channel integrity), result parsing, budgets, and end-to-end integration tests that spin up a real mock MCP server (including crash-and-reconnect). Built on MCP Python SDK 2.x; serves both 2025-era clients (e.g. Claude Code) and 2026-07-28 clients.

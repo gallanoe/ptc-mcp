@@ -4,11 +4,19 @@
 # MCP servers to connect to as a client.
 # Each server's tools become available as async functions in execute_program.
 servers: []
-  # Example stdio server:
+  # Example stdio server (secrets via ${VAR} from ptc-mcp's environment):
   # - name: financial-data
   #   transport: stdio
   #   command: node
   #   args: ["./financial-data-mcp/dist/index.js"]
+  #   env:
+  #     API_KEY: ${FINANCIAL_DATA_API_KEY}
+  #
+  # Example streamable HTTP server:
+  # - name: remote
+  #   transport: http
+  #   url: "https://example.com/mcp"
+  #   headers: {Authorization: "Bearer ${REMOTE_TOKEN}"}
   #
   # Example SSE server:
   # - name: internal-apis
@@ -20,7 +28,7 @@ servers: []
 tools: {}
   # block:
   #   - "mcp__internal_apis__delete_resource"
-  # allow:
+  # allow:                       # glob patterns work, e.g. "mcp__financial_data__*"
   #   - "mcp__financial_data__query_financials"
 
 # Execution constraints for execute_program.
@@ -30,3 +38,8 @@ execution:
   # "seatbelt" (macOS sandbox-exec, default) or "none" (no OS sandbox; opt-in).
   # See README "Sandbox".
   sandbox: seatbelt
+  # Per-program tool-call budget (see README "Results, errors, and budgets").
+  max_tool_calls: 100
+  max_concurrent_calls: 8
+  tool_call_timeout_seconds: 60
+  trace: summary

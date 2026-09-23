@@ -8,10 +8,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-import mcp.server.stdio
 import mcp.types as types
-from mcp.server.lowlevel import NotificationOptions, Server
-from mcp.server.models import InitializationOptions
+from mcp.server import Server
+from mcp.server.context import ServerRequestContext
+from mcp.server.stdio import stdio_server
 
 from .config import load_config
 from .executor import ExecutionEngine
@@ -50,91 +50,98 @@ async def server_lifespan(_server: Server) -> AsyncIterator[dict[str, Any]]:
         logger.info("Registry shut down")
 
 
+SERVER_VERSION = "0.2.0"
+
+
+def _tool_definitions() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="execute_program",
+            description=(
+                "Execute a Python program with access to MCP tools as async functions. "
+                "The program runs in a sandboxed, standard-library-only interpreter with "
+                "no network, no subprocesses, and no filesystem access except a temporary "
+                "scratch directory (the working directory); tools are the only way to "
+                "reach data. "
+                "Tool calls within the script are dispatched to their respective MCP servers. "
+                "Only stdout (from print statements) is returned — intermediate tool results "
+                "do not enter the conversation context. Use this when a task involves 3+ tool "
+                "calls, loops, filtering, aggregation, or conditional logic based on intermediate "
+                "results. For single tool calls, call the tool directly. All tool functions "
+                "require `await` and take keyword arguments. A failed tool call raises "
+                "`ToolError` (catch it to continue). Results are parsed JSON; server notes "
+                "(e.g. empty-result warnings) appear under a `_notes` key. Call "
+                "`emit(value)` to return a structured JSON result. Helpers: "
+                "`list_callable_tools()`, `inspect_tool(tool_name=...)`, `server_status()`. "
+                "Each program has a tool-call budget and a per-call timeout."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Python code to execute. MCP tools are available as async "
+                            "functions using their namespaced names (e.g., "
+                            "mcp__financial_data__query_financials). Use `await` for all "
+                            "tool calls. Use `print()` to produce output."
+                        ),
+                    }
+                },
+                "required": ["code"],
+            },
+        ),
+        types.Tool(
+            name="inspect_tool",
+            description=(
+                "Returns the schema and description of a tool available in "
+                "execute_program. Includes outputSchema if the upstream MCP server "
+                "defines one. Call this before writing a script if you need to "
+                "understand a tool's return format."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": (
+                            "Namespaced tool name "
+                            "(e.g., mcp__financial_data__query_financials)"
+                        ),
+                    }
+                },
+                "required": ["tool_name"],
+            },
+        ),
+        types.Tool(
+            name="list_callable_tools",
+            description=(
+                "Returns a JSON list of all tool names available for use inside "
+                "execute_program scripts. Use this to discover which tools are "
+                "callable before writing a program."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+    ]
+
+
 def create_server() -> Server:
     """Create and configure the MCP server."""
-    server = Server("ptc-mcp", lifespan=server_lifespan)
 
-    @server.list_tools()
-    async def handle_list_tools() -> list[types.Tool]:
-        return [
-            types.Tool(
-                name="execute_program",
-                description=(
-                    "Execute a Python program with access to MCP tools as async functions. "
-                    "The program runs in a sandboxed, standard-library-only interpreter with "
-                    "no network, no subprocesses, and no filesystem access except a temporary "
-                    "scratch directory (the working directory); tools are the only way to "
-                    "reach data. "
-                    "Tool calls within the script are dispatched to their respective MCP servers. "
-                    "Only stdout (from print statements) is returned — intermediate tool results "
-                    "do not enter the conversation context. Use this when a task involves 3+ tool "
-                    "calls, loops, filtering, aggregation, or conditional logic based on intermediate "
-                    "results. For single tool calls, call the tool directly. All tool functions "
-                    "require `await` and take keyword arguments. A failed tool call raises "
-                    "`ToolError` (catch it to continue). Results are parsed JSON; server notes "
-                    "(e.g. empty-result warnings) appear under a `_notes` key. Call "
-                    "`emit(value)` to return a structured JSON result. Helpers: "
-                    "`list_callable_tools()`, `inspect_tool(tool_name=...)`, `server_status()`. "
-                    "Each program has a tool-call budget and a per-call timeout."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "code": {
-                            "type": "string",
-                            "description": (
-                                "Python code to execute. MCP tools are available as async "
-                                "functions using their namespaced names (e.g., "
-                                "mcp__financial_data__query_financials). Use `await` for all "
-                                "tool calls. Use `print()` to produce output."
-                            ),
-                        }
-                    },
-                    "required": ["code"],
-                },
-            ),
-            types.Tool(
-                name="inspect_tool",
-                description=(
-                    "Returns the schema and description of a tool available in "
-                    "execute_program. Includes outputSchema if the upstream MCP server "
-                    "defines one. Call this before writing a script if you need to "
-                    "understand a tool's return format."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "tool_name": {
-                            "type": "string",
-                            "description": (
-                                "Namespaced tool name "
-                                "(e.g., mcp__financial_data__query_financials)"
-                            ),
-                        }
-                    },
-                    "required": ["tool_name"],
-                },
-            ),
-            types.Tool(
-                name="list_callable_tools",
-                description=(
-                    "Returns a JSON list of all tool names available for use inside "
-                    "execute_program scripts. Use this to discover which tools are "
-                    "callable before writing a program."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {},
-                },
-            ),
-        ]
+    async def handle_list_tools(
+        ctx: ServerRequestContext[dict[str, Any]], params: types.PaginatedRequestParams | None
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(tools=_tool_definitions())
 
-    @server.call_tool()
     async def handle_call_tool(
-        name: str, arguments: dict[str, Any]
-    ) -> list[types.TextContent] | types.CallToolResult:
-        ctx = server.request_context
+        ctx: ServerRequestContext[dict[str, Any]], params: types.CallToolRequestParams
+    ) -> types.CallToolResult:
         registry: ToolRegistry = ctx.lifespan_context["registry"]
+        name = params.name
+        arguments = params.arguments or {}
 
         if name == "execute_program":
             executor: ExecutionEngine = ctx.lifespan_context["executor"]
@@ -143,13 +150,16 @@ def create_server() -> Server:
             # Failed runs (script error, timeout, sandbox failure) are MCP errors
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=outcome.text)],
-                structuredContent=outcome.structured,
-                isError=not outcome.ok,
+                structured_content=outcome.structured,
+                is_error=not outcome.ok,
             )
-        elif name == "inspect_tool":
-            tool_name = arguments.get("tool_name", "")
-            result = registry.inspect_tool(tool_name)
-        elif name == "list_callable_tools":
+        if name == "inspect_tool":
+            text = registry.inspect_tool(arguments.get("tool_name", ""))
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=text)],
+                is_error=text.startswith("[Tool not found]"),
+            )
+        if name == "list_callable_tools":
             content = [types.TextContent(type="text", text=registry.list_tool_names())]
             down = registry.unavailable_servers()
             if down:
@@ -158,29 +168,23 @@ def create_server() -> Server:
                     type="text",
                     text=f"UNAVAILABLE SERVERS (their tools are not listed; reconnecting): {detail}",
                 ))
-            return content
-        else:
-            raise ValueError(f"Unknown tool: {name}")
+            return types.CallToolResult(content=content)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"Unknown tool: {name}")],
+            is_error=True,
+        )
 
-        return [types.TextContent(type="text", text=result)]
-
-    return server
+    return Server(
+        "ptc-mcp",
+        version=SERVER_VERSION,
+        lifespan=server_lifespan,
+        on_list_tools=handle_list_tools,
+        on_call_tool=handle_call_tool,
+    )
 
 
 async def run_server() -> None:
     """Run the MCP server over stdio."""
     server = create_server()
-
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="ptc-mcp",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, server.create_initialization_options())

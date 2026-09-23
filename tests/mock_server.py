@@ -1,10 +1,10 @@
-"""A mock MCP server for integration testing using FastMCP."""
+"""A mock MCP server for integration testing using MCPServer."""
 
 import json
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("mock-test-server")
+mcp = MCPServer("mock-test-server")
 
 
 @mcp.tool()
@@ -40,8 +40,16 @@ def crash() -> str:
 
 @mcp.tool()
 def fail() -> str:
-    """Raise an error inside the tool (returned to the client as isError)."""
-    raise ValueError("mock failure")
+    """Fail deliberately: returned to the client as an is_error result."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    raise ToolError("mock failure")
+
+
+@mcp.tool()
+def boom() -> str:
+    """Raise an unexpected exception: a JSON-RPC error with a generic message."""
+    raise ValueError("internal detail")
 
 
 if __name__ == "__main__":
