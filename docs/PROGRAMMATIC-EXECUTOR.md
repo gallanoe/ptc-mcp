@@ -1,4 +1,9 @@
 # Programmatic Tool Calling MCP Server
+
+> **Update (2026-09):** execution is no longer in-process `exec()`. Each program
+> runs in a sandboxed child interpreter (`sandbox.py`, `_runner.py`); see the
+> README's "Sandbox" section. The in-process execution sketches below describe
+> the original design.
 ## 1. Problem Statement
 
 Claude Code operates on subscription plans and does not have access to the Anthropic API's programmatic tool calling (PTC) feature. PTC enables Claude to write Python programs that call multiple tools within a single execution, returning only the final output to the model's context window. Without PTC, every tool invocation in Claude Code requires a full round-trip through the model — each intermediate result enters the context window, consuming tokens and adding latency.
@@ -104,6 +109,7 @@ execution:
 - **`tools.allow`** — if specified, only listed tools are permitted. `allow` and `block` are mutually exclusive.
 - **`execution.timeout_seconds`** — maximum wall-clock time for a single `execute_program` invocation.
 - **`execution.max_output_bytes`** — stdout is truncated beyond this limit.
+- **`execution.sandbox`** — `seatbelt` (default; macOS `sandbox-exec`) or `none`.
 
 ## 5. Tool Registry
 
@@ -390,4 +396,5 @@ tools:                            # Access control (optional)
 execution:                        # Runtime constraints
   timeout_seconds: integer        # Max execution time (default: 120)
   max_output_bytes: integer       # Max stdout size (default: 65536)
+  sandbox: string                 # "seatbelt" (default) or "none"
 ```

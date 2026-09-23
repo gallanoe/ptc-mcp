@@ -114,11 +114,44 @@ tools:
 execution:
   timeout_seconds: 120
   max_output_bytes: 65536
+  sandbox: seatbelt   # or "none"
 ```
 
 - **servers** — MCP servers to bridge. Supports `stdio` and `sse` transports.
 - **tools.allow / tools.block** — Whitelist or blacklist namespaced tool names (mutually exclusive). Omit both to allow everything.
-- **execution** — Timeout and output size limits for `execute_program`.
+- **execution** — Timeout and output size limits for `execute_program`, and the sandbox mode (below).
+
+## Sandbox
+
+Scripts never run inside the server process. Each `execute_program` call starts a
+fresh child interpreter and talks to it over stdin/stdout; only the server holds
+the MCP sessions, so **tools are the only way a script can reach data**.
+
+- **`sandbox: seatbelt`** (default, macOS): the child runs under `sandbox-exec`
+  with a deny-by-default profile — no network, no subprocesses or `fork`, no
+  reads or writes outside a per-run scratch directory (its working directory,
+  deleted afterwards), and no way to even check whether files exist elsewhere.
+- **`sandbox: none`**: same child process, empty environment, and limits, but
+  without the OS sandbox. Explicit opt-in (e.g. Linux CI). If `seatbelt` is
+  configured but unavailable, scripts refuse to run rather than fall back.
+
+In every mode the child:
+
+- gets an **empty environment** (API keys in the server's environment or in a
+  server's `env` config are never visible to scripts),
+- runs the base interpreter with `-I -S`: **standard library only** — the
+  server's own packages are not importable,
+- is **killed at `timeout_seconds`**, including CPU-bound code (`while True:`),
+  with CPU-time, file-size and open-file limits as a backstop,
+- cannot corrupt the tool channel: `print`, `os.write(1, ...)`, and leftover
+  background tasks all stay inside the child.
+
+`sandbox-exec` is deprecated by Apple but still ships and enforces (Claude Code
+and Codex CLI use it the same way). It is isolated in `sandbox.py`, so another
+backend (Docker, Apple `container`) can replace it.
+
+Failed runs — script errors, timeouts, sandbox failures — are returned with MCP
+`isError: true`.
 
 The server starts fine with no config file or an empty `servers` list.
 

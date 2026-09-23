@@ -35,6 +35,9 @@ class ExecutionConfig:
 
     timeout_seconds: int = 120
     max_output_bytes: int = 65536
+    # "seatbelt": run scripts under sandbox-exec (macOS). "none": child process
+    # without an OS sandbox (explicit opt-in, e.g. for Linux CI).
+    sandbox: str = "seatbelt"
 
 
 @dataclass
@@ -88,6 +91,11 @@ def load_config(path: str | Path) -> Config:
     execution = ExecutionConfig(
         timeout_seconds=exec_raw.get("timeout_seconds", 120),
         max_output_bytes=exec_raw.get("max_output_bytes", 65536),
+        sandbox=exec_raw.get("sandbox", "seatbelt"),
     )
+    if execution.sandbox not in ("seatbelt", "none"):
+        raise ValueError(
+            f"execution.sandbox must be 'seatbelt' or 'none', got {execution.sandbox!r}"
+        )
 
     return Config(servers=servers, tools=tools, execution=execution)

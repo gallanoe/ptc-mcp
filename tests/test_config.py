@@ -114,3 +114,18 @@ class TestLoadConfig:
         }
         config = load_config(_write_yaml(tmp_path, data))
         assert config.servers[0].env == {"API_KEY": "test123"}
+
+
+class TestSandboxConfig:
+    def test_default_is_seatbelt(self, tmp_path):
+        config = load_config(_write_yaml(tmp_path, {"servers": []}))
+        assert config.execution.sandbox == "seatbelt"
+        assert ExecutionConfig().sandbox == "seatbelt"
+
+    def test_none_is_explicit_opt_in(self, tmp_path):
+        config = load_config(_write_yaml(tmp_path, {"execution": {"sandbox": "none"}}))
+        assert config.execution.sandbox == "none"
+
+    def test_unknown_mode_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="execution.sandbox"):
+            load_config(_write_yaml(tmp_path, {"execution": {"sandbox": "docker"}}))

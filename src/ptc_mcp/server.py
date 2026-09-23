@@ -61,6 +61,10 @@ def create_server() -> Server:
                 name="execute_program",
                 description=(
                     "Execute a Python program with access to MCP tools as async functions. "
+                    "The program runs in a sandboxed, standard-library-only interpreter with "
+                    "no network, no subprocesses, and no filesystem access except a temporary "
+                    "scratch directory (the working directory); tools are the only way to "
+                    "reach data. "
                     "Tool calls within the script are dispatched to their respective MCP servers. "
                     "Only stdout (from print statements) is returned — intermediate tool results "
                     "do not enter the conversation context. Use this when a task involves 3+ tool "
@@ -123,14 +127,19 @@ def create_server() -> Server:
     @server.call_tool()
     async def handle_call_tool(
         name: str, arguments: dict[str, Any]
-    ) -> list[types.TextContent]:
+    ) -> list[types.TextContent] | types.CallToolResult:
         ctx = server.request_context
         registry: ToolRegistry = ctx.lifespan_context["registry"]
 
         if name == "execute_program":
             executor: ExecutionEngine = ctx.lifespan_context["executor"]
             code = arguments.get("code", "")
-            result = await executor.run(code, registry.get_namespace())
+            outcome = await executor.execute(code, registry.get_namespace())
+            # Failed runs (script error, timeout, sandbox failure) are MCP errors
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=outcome.text)],
+                isError=not outcome.ok,
+            )
         elif name == "inspect_tool":
             tool_name = arguments.get("tool_name", "")
             result = registry.inspect_tool(tool_name)

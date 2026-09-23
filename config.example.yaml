@@ -27,3 +27,6 @@ tools: {}
 execution:
   timeout_seconds: 120
   max_output_bytes: 65536
+  # "seatbelt" (macOS sandbox-exec, default) or "none" (no OS sandbox; opt-in).
+  # See README "Sandbox".
+  sandbox: seatbelt
