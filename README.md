@@ -94,7 +94,7 @@ uv venv && uv pip install -e ".[dev]"
 
 ## Configuration
 
-Create a `config.yaml` (or set `PTC_MCP_CONFIG` to point elsewhere):
+Copy `config.example.yaml` to `config.yaml` (gitignored, since it usually holds API keys) and edit it, or set `PTC_MCP_CONFIG` to point elsewhere:
 
 ```yaml
 servers:

@@ -24,3 +24,6 @@ htmlcov/
 
 # Environment
 .env
+
+# Local config (holds API keys) — copy config.example.yaml
+config.yaml
