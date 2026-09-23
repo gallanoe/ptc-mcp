@@ -116,3 +116,42 @@ class TestExecutionEngine:
         result2 = await engine.run(code2, {})
         assert "[Script execution failed]" in result2
         assert "NameError" in result2
+
+    async def test_list_callable_tools_in_script(self, engine):
+        async def mock_list_callable_tools() -> list[str]:
+            return ["mcp__srv__alpha", "mcp__srv__beta"]
+
+        async def mock_tool(**kwargs):
+            return "ok"
+
+        namespace = {
+            "list_callable_tools": mock_list_callable_tools,
+            "mcp__srv__alpha": mock_tool,
+            "mcp__srv__beta": mock_tool,
+        }
+        code = (
+            "tools = await list_callable_tools()\n"
+            "print(type(tools).__name__)\n"
+            "print(tools)"
+        )
+        result = await engine.run(code, namespace)
+        assert "[Script executed successfully]" in result
+        assert "list" in result
+        assert "mcp__srv__alpha" in result
+
+    async def test_inspect_tool_in_script(self, engine):
+        async def mock_inspect_tool(*, tool_name: str) -> dict | str:
+            if tool_name == "mcp__srv__alpha":
+                return {"name": "mcp__srv__alpha", "description": "Alpha tool"}
+            return f"[Tool not found] '{tool_name}' is not available"
+
+        namespace = {"inspect_tool": mock_inspect_tool}
+        code = (
+            "info = await inspect_tool(tool_name='mcp__srv__alpha')\n"
+            "print(type(info).__name__)\n"
+            "print(info['name'])"
+        )
+        result = await engine.run(code, namespace)
+        assert "[Script executed successfully]" in result
+        assert "dict" in result
+        assert "mcp__srv__alpha" in result

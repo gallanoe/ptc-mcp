@@ -156,7 +156,25 @@ class ToolRegistry:
 
     def get_namespace(self) -> dict[str, Callable[..., Any]]:
         """Return tool namespace dict for injection into exec."""
-        return {name: rt.handler for name, rt in self._tools.items()}
+        ns: dict[str, Callable[..., Any]] = {
+            name: rt.handler for name, rt in self._tools.items()
+        }
+
+        async def list_callable_tools() -> list[str]:
+            """Return sorted list of all registered tool names."""
+            return sorted(self._tools.keys())
+
+        async def _inspect_tool_impl(*, tool_name: str) -> dict | str:
+            """Return parsed schema dict for a tool, or error string if not found."""
+            raw = self.inspect_tool(tool_name)
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return raw
+
+        ns["list_callable_tools"] = list_callable_tools
+        ns["inspect_tool"] = _inspect_tool_impl
+        return ns
 
     def list_tool_names(self) -> str:
         """Return a JSON array of all registered tool names."""

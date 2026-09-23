@@ -176,3 +176,82 @@ class TestListCallableToolsIntegration:
             assert result == sorted(result)
 
         await _run_with_registry(_make_config(), check)
+
+
+class TestInScriptIntrospection:
+    async def test_list_callable_tools_returns_list(self):
+        executor = ExecutionEngine(ExecutionConfig(timeout_seconds=10, max_output_bytes=65536))
+
+        async def check(reg):
+            code = (
+                "tools = await list_callable_tools()\n"
+                "print(type(tools).__name__)\n"
+                "print('add_present:', 'mcp__mock_test__add' in tools)\n"
+                "print('is_sorted:', tools == sorted(tools))"
+            )
+            output = await executor.run(code, reg.get_namespace())
+            assert "[Script executed successfully]" in output
+            assert "list" in output
+            assert "add_present: True" in output
+            assert "is_sorted: True" in output
+
+        await _run_with_registry(_make_config(), check)
+
+    async def test_inspect_tool_returns_dict(self):
+        executor = ExecutionEngine(ExecutionConfig(timeout_seconds=10, max_output_bytes=65536))
+
+        async def check(reg):
+            code = (
+                "info = await inspect_tool(tool_name='mcp__mock_test__add')\n"
+                "print(type(info).__name__)\n"
+                "print('name:', info['name'])\n"
+                "print('has_input:', 'inputSchema' in info)\n"
+                "print('has_output:', 'outputSchema' in info)"
+            )
+            output = await executor.run(code, reg.get_namespace())
+            assert "[Script executed successfully]" in output
+            assert "dict" in output
+            assert "name: mcp__mock_test__add" in output
+            assert "has_input: True" in output
+            assert "has_output: True" in output
+
+        await _run_with_registry(_make_config(), check)
+
+    async def test_inspect_unknown_tool_returns_string(self):
+        executor = ExecutionEngine(ExecutionConfig(timeout_seconds=10, max_output_bytes=65536))
+
+        async def check(reg):
+            code = (
+                "result = await inspect_tool(tool_name='mcp__nonexistent__foo')\n"
+                "print(type(result).__name__)\n"
+                "print(result)"
+            )
+            output = await executor.run(code, reg.get_namespace())
+            assert "[Script executed successfully]" in output
+            assert "str" in output
+            assert "[Tool not found]" in output
+
+        await _run_with_registry(_make_config(), check)
+
+    async def test_list_inspect_call_workflow(self):
+        executor = ExecutionEngine(ExecutionConfig(timeout_seconds=10, max_output_bytes=65536))
+
+        async def check(reg):
+            code = (
+                "# Step 1: discover tools\n"
+                "tools = await list_callable_tools()\n"
+                "# Step 2: find and inspect the add tool\n"
+                "add_name = [t for t in tools if 'add' in t][0]\n"
+                "schema = await inspect_tool(tool_name=add_name)\n"
+                "print('tool:', schema['name'])\n"
+                "# Step 3: call it dynamically using the namespace\n"
+                "result = await mcp__mock_test__add(a=5, b=7)\n"
+                "print('result:', result)"
+            )
+            output = await executor.run(code, reg.get_namespace())
+            assert "[Script executed successfully]" in output
+            assert "tool: mcp__mock_test__add" in output
+            assert "result:" in output
+            assert "12" in output
+
+        await _run_with_registry(_make_config(), check)

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from ptc_mcp.config import Config, ToolsConfig
+from ptc_mcp.errors import ToolError
 from ptc_mcp.registry import RegisteredTool, ToolRegistry
 
 
@@ -170,3 +171,88 @@ class TestInspectTool:
         reg = self._make_registry()
         result = reg.inspect_tool("mcp__nonexistent__foo")
         assert result.startswith("[Tool not found]")
+
+
+class TestGetNamespaceIntrospection:
+    def _make_registry(self) -> ToolRegistry:
+        config = Config(tools=ToolsConfig())
+        return ToolRegistry(config)
+
+    def _add_tool(self, reg: ToolRegistry, name: str, **kwargs) -> None:
+        defaults = {
+            "description": "A tool",
+            "parameters": {"type": "object", "properties": {}},
+            "output_schema": None,
+            "handler": lambda **kw: None,
+        }
+        defaults.update(kwargs)
+        reg._tools[name] = RegisteredTool(name=name, **defaults)
+
+    def test_namespace_includes_introspection_functions(self):
+        reg = self._make_registry()
+        ns = reg.get_namespace()
+        assert "list_callable_tools" in ns
+        assert "inspect_tool" in ns
+
+    async def test_list_callable_tools_empty(self):
+        reg = self._make_registry()
+        ns = reg.get_namespace()
+        result = await ns["list_callable_tools"]()
+        assert result == []
+        assert isinstance(result, list)
+
+    async def test_list_callable_tools_sorted(self):
+        reg = self._make_registry()
+        self._add_tool(reg, "mcp__srv__beta")
+        self._add_tool(reg, "mcp__srv__alpha")
+        ns = reg.get_namespace()
+        result = await ns["list_callable_tools"]()
+        assert result == ["mcp__srv__alpha", "mcp__srv__beta"]
+        assert isinstance(result, list)
+
+    async def test_inspect_tool_returns_dict(self):
+        reg = self._make_registry()
+        self._add_tool(
+            reg,
+            "mcp__srv__mytool",
+            description="A test tool",
+            parameters={
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+            },
+        )
+        ns = reg.get_namespace()
+        result = await ns["inspect_tool"](tool_name="mcp__srv__mytool")
+        assert isinstance(result, dict)
+        assert result["name"] == "mcp__srv__mytool"
+        assert result["description"] == "A test tool"
+        assert result["inputSchema"]["properties"]["x"]["type"] == "integer"
+
+    async def test_inspect_tool_with_output_schema(self):
+        reg = self._make_registry()
+        output_schema = {"type": "object", "properties": {"value": {"type": "number"}}}
+        self._add_tool(reg, "mcp__srv__mytool", output_schema=output_schema)
+        ns = reg.get_namespace()
+        result = await ns["inspect_tool"](tool_name="mcp__srv__mytool")
+        assert isinstance(result, dict)
+        assert result["outputSchema"] == output_schema
+        assert "note" not in result
+
+    async def test_inspect_tool_not_found_returns_string(self):
+        reg = self._make_registry()
+        ns = reg.get_namespace()
+        result = await ns["inspect_tool"](tool_name="mcp__nonexistent__foo")
+        assert isinstance(result, str)
+        assert result.startswith("[Tool not found]")
+
+    def test_introspection_names_dont_collide_with_bridge_names(self):
+        reg = self._make_registry()
+        self._add_tool(reg, "mcp__srv__tool")
+        ns = reg.get_namespace()
+        # Bridge names use mcp__ prefix; introspection names don't
+        assert "list_callable_tools" in ns
+        assert "inspect_tool" in ns
+        assert "mcp__srv__tool" in ns
+        assert not "list_callable_tools".startswith("mcp__")
+        assert not "inspect_tool".startswith("mcp__")
