@@ -226,6 +226,12 @@ class ExecutionEngine:
                         )
                     reply = {"type": "result", "id": call_id, "ok": True,
                              "value": _jsonable(value)}
+                    size = len(json.dumps(reply["value"]).encode("utf-8"))
+                    if size > cfg.max_tool_result_bytes:
+                        reply = {"type": "result", "id": call_id, "ok": False,
+                                 "error": f"'{name}' result is {size} bytes, over the "
+                                          f"{cfg.max_tool_result_bytes}-byte limit; request less "
+                                          "data (narrower dates, a limit, or a filter)"}
                 except asyncio.TimeoutError:
                     reply = {"type": "result", "id": call_id, "ok": False,
                              "error": f"'{name}' timed out after {cfg.tool_call_timeout_seconds}s"}

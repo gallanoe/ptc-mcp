@@ -123,6 +123,7 @@ execution:
   max_concurrent_calls: 8
   tool_call_timeout_seconds: 60
   trace: summary               # or "off"
+  max_tool_result_bytes: 16777216  # per tool result passed into a script
 ```
 
 - **servers** — MCP servers to bridge: `stdio`, `http` (streamable HTTP), or `sse`.
@@ -141,8 +142,14 @@ Inside a program:
   is used directly; any extra text the server sent (e.g. "EMPTY RESULT …"
   warnings) is kept under a `_notes` key instead of being lost or turning the
   result into a string.
-- A tool that fails (an `is_error` result, a protocol error, a timeout, a lost
-  connection, or an exhausted budget) raises `ToolError`; catch it to continue.
+- A tool that fails raises `ToolError`; catch it to continue. That covers an
+  `is_error` result, a protocol error, a timeout, an exhausted budget, a result
+  that does not match the tool's declared output schema, a result larger than
+  `max_tool_result_bytes`, and a lost connection. Only a lost connection
+  triggers a reconnect; bad data from a healthy server never does.
+- Non-text content (images, audio, embedded resources) cannot enter the
+  sandbox; it is replaced by a `_notes` placeholder such as
+  `[non-text content omitted: image (image/png)]` rather than dropped silently.
 - `emit(value)` returns a JSON-serializable structured result (last call wins).
   It appears after `--- result ---` in the output and as `result` in the
   `execute_program` structured content.
@@ -154,6 +161,11 @@ at a time, each bounded by `tool_call_timeout_seconds`. With `trace: summary`
 the output ends with a line such as `[tool calls: 12, 1 failed; 2.3s]` plus the
 failures; the structured content always lists every call (tool, arguments, ok,
 duration, error).
+
+Known limitation: FastMCP-style servers wrap non-object returns as
+`{"result": value}` and ptc unwraps that shape. A server that genuinely returns
+an object whose only key is `result`, alongside prose text that is not its JSON
+rendering, is indistinguishable and will be unwrapped too.
 
 Each downstream server is supervised: if it fails to start or its connection
 drops, ptc-mcp keeps reconnecting with backoff. Its tools disappear from

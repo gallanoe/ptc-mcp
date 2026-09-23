@@ -338,3 +338,80 @@ class TestServerLifecycle:
             assert "True" in out.text
 
         await _with_registry(Config(servers=[_mock_server()]), check)
+
+
+class _FakeConn:
+    def __init__(self, exc):
+        self.name = "srv"
+        self.error = None
+        self.reconnects = []
+
+        async def call_tool(name, args):
+            raise exc
+
+        self.session = SimpleNamespace(call_tool=call_tool)
+
+    def request_reconnect(self, reason):
+        self.reconnects.append(reason)
+
+
+class TestUnexpectedResults:
+    def _handler(self, exc):
+        conn = _FakeConn(exc)
+        reg = ToolRegistry(Config())
+        return reg._make_bridge_handler(conn, "tool", "mcp__srv__tool"), conn
+
+    async def test_schema_mismatch_is_tool_error_without_reconnect(self):
+        handler, conn = self._handler(RuntimeError(
+            "Invalid structured content returned by tool tool: None is not of type 'number'"))
+        with pytest.raises(ToolError, match="does not match its declared output schema"):
+            await handler()
+        assert conn.reconnects == []
+
+    async def test_missing_structured_content_is_schema_mismatch(self):
+        handler, conn = self._handler(RuntimeError(
+            "Tool tool has an output schema but did not return structured content"))
+        with pytest.raises(ToolError, match="declared output schema"):
+            await handler()
+        assert conn.reconnects == []
+
+    async def test_transport_failure_reconnects(self):
+        import anyio
+
+        handler, conn = self._handler(anyio.ClosedResourceError())
+        with pytest.raises(ToolError, match="connection to 'srv' lost"):
+            await handler()
+        assert len(conn.reconnects) == 1
+
+    async def test_other_errors_do_not_reconnect(self):
+        handler, conn = self._handler(ValueError("weird payload"))
+        with pytest.raises(ToolError, match="ValueError: weird payload"):
+            await handler()
+        assert conn.reconnects == []
+
+    def test_non_text_content_leaves_a_placeholder(self):
+        from mcp.types import ImageContent
+
+        img = ImageContent(type="image", data="aGk=", mime_type="image/png")
+        only_image = SimpleNamespace(content=[img], structured_content=None, is_error=False)
+        assert ToolRegistry._parse_mcp_result(only_image) == {
+            "data": None, "_notes": ["[non-text content omitted: image (image/png)]"]}
+        mixed = SimpleNamespace(content=[TextContent(type="text", text='{"a": 1}'), img],
+                                structured_content=None, is_error=False)
+        assert ToolRegistry._parse_mcp_result(mixed) == {
+            "a": 1, "_notes": ["[non-text content omitted: image (image/png)]"]}
+
+    async def test_oversized_result_is_refused(self):
+        async def big(**kw):
+            return "x" * 5000
+
+        code = "try:\n    await big()\nexcept ToolError as e:\n    print('refused:', e)"
+        out = await _engine(max_tool_result_bytes=1000).execute(code, {"big": big})
+        assert out.ok, out.text
+        assert "over the 1000-byte limit" in out.text
+
+    def test_result_cap_must_fit_the_channel(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        p.write_text("execution: {max_tool_result_bytes: 100000000}\n")
+        with pytest.raises(ValueError, match="max_tool_result_bytes must be <="):
+            load_config(p)

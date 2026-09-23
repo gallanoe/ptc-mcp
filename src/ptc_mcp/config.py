@@ -13,6 +13,8 @@ import yaml
 TRANSPORTS = ("stdio", "sse", "http")
 SANDBOX_MODES = ("seatbelt", "none")
 TRACE_MODES = ("summary", "off")
+# Must stay below the child runner's 64 MiB channel read limit (see _runner.py).
+MAX_TOOL_RESULT_CEILING = 48 * 1024 * 1024
 
 
 @dataclass
@@ -50,6 +52,8 @@ class ExecutionConfig:
     max_tool_calls: int = 100
     max_concurrent_calls: int = 8
     tool_call_timeout_seconds: float = 60
+    # Largest single tool result passed into a script (serialized JSON bytes).
+    max_tool_result_bytes: int = 16 * 1024 * 1024
     # "summary": append a one-line call count (plus any failures) to the output.
     trace: str = "summary"
 
@@ -145,6 +149,7 @@ def load_config(path: str | Path) -> Config:
             "tool_call_timeout_seconds", defaults.tool_call_timeout_seconds
         ),
         trace=exec_raw.get("trace", defaults.trace),
+        max_tool_result_bytes=exec_raw.get("max_tool_result_bytes", defaults.max_tool_result_bytes),
     )
     if execution.sandbox not in SANDBOX_MODES:
         raise ValueError(
@@ -152,8 +157,14 @@ def load_config(path: str | Path) -> Config:
         )
     if execution.trace not in TRACE_MODES:
         raise ValueError(f"execution.trace must be one of {TRACE_MODES}, got {execution.trace!r}")
-    for key in ("max_tool_calls", "max_concurrent_calls", "tool_call_timeout_seconds"):
+    for key in ("max_tool_calls", "max_concurrent_calls", "tool_call_timeout_seconds",
+                "max_tool_result_bytes"):
         if not getattr(execution, key) > 0:
             raise ValueError(f"execution.{key} must be > 0")
+    if execution.max_tool_result_bytes > MAX_TOOL_RESULT_CEILING:
+        raise ValueError(
+            f"execution.max_tool_result_bytes must be <= {MAX_TOOL_RESULT_CEILING} "
+            "(the script's channel limit)"
+        )
 
     return Config(servers=servers, tools=tools, execution=execution)

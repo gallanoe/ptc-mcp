@@ -105,6 +105,7 @@ class _Rpc:
         self._out_fd = out_fd
         self._next_id = 0
         self._pending = {}
+        self._broken = None  # set when the channel from the parent fails
 
     def send(self, msg):
         data = (json.dumps(msg) + "\n").encode("utf-8")
@@ -119,15 +120,23 @@ class _Rpc:
             raise EOFError("parent closed the channel")
         return json.loads(line)
 
+    def _fail_pending(self, reason):
+        self._broken = reason
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(ToolError(reason))
+        self._pending.clear()
+
     async def dispatch_results(self):
         """Resolve pending call futures as results arrive."""
         while True:
             try:
                 msg = await self.recv()
             except EOFError:
-                for fut in self._pending.values():
-                    if not fut.done():
-                        fut.set_exception(ToolError("tool channel closed"))
+                self._fail_pending("tool channel closed")
+                return
+            except Exception as e:  # oversized or malformed message: the channel is unusable
+                self._fail_pending(f"tool channel failed: {type(e).__name__}: {e}")
                 return
             fut = self._pending.pop(msg.get("id"), None)
             if fut is None or fut.done():
@@ -138,6 +147,8 @@ class _Rpc:
                 fut.set_exception(ToolError(msg.get("error") or "tool call failed"))
 
     async def call(self, tool, args):
+        if self._broken:
+            raise ToolError(self._broken)
         self._next_id += 1
         call_id = self._next_id
         fut = asyncio.get_running_loop().create_future()

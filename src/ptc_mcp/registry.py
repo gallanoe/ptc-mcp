@@ -12,6 +12,8 @@ import asyncio
 import fnmatch
 import json
 import logging
+
+import anyio
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -242,12 +244,21 @@ class ToolRegistry:
                     f"'{namespaced}' failed: connection to '{conn.name}' closed; "
                     "reconnecting — retry shortly"
                 ) from e
-            except Exception as e:  # noqa: BLE001 - transport failure: reconnect
-                conn.request_reconnect(f"{type(e).__name__}: {e}")
-                raise ToolError(
-                    f"'{namespaced}' failed: connection to '{conn.name}' lost ({e}); "
-                    "reconnecting — retry shortly"
-                ) from e
+            except Exception as e:  # noqa: BLE001 - classified below
+                if _is_transport_failure(e):
+                    conn.request_reconnect(f"{type(e).__name__}: {e}")
+                    raise ToolError(
+                        f"'{namespaced}' failed: connection to '{conn.name}' lost ({e}); "
+                        "reconnecting — retry shortly"
+                    ) from e
+                if _is_schema_mismatch(e):
+                    # The client validates results against the tool's declared outputSchema;
+                    # a mismatch is bad data from a healthy server, not a lost connection.
+                    raise ToolError(
+                        f"'{namespaced}' returned data that does not match its declared "
+                        f"output schema: {e}"
+                    ) from e
+                raise ToolError(f"'{namespaced}' failed: {type(e).__name__}: {e}") from e
             return self._parse_mcp_result(result, namespaced)
 
         handler.__name__ = namespaced
@@ -264,11 +275,12 @@ class ToolRegistry:
           (e.g. "EMPTY RESULT ..."); they are kept under a ``_notes`` key.
         - Otherwise the text is JSON-decoded when possible, else returned as-is.
         """
-        texts = [
-            c.text
-            for c in (getattr(result, "content", None) or [])
-            if isinstance(c, TextContent) or hasattr(c, "text")
-        ]
+        items = getattr(result, "content", None) or []
+        texts = [c.text for c in items if isinstance(c, TextContent) or hasattr(c, "text")]
+        # Non-text content (images, audio, resources) cannot cross into the script; say so
+        # instead of dropping it silently.
+        omitted = [_describe_non_text(c) for c in items
+                   if not (isinstance(c, TextContent) or hasattr(c, "text"))]
 
         if getattr(result, "is_error", False) is True:
             detail = " ".join(t.strip() for t in texts if t.strip()) or "no details"
@@ -279,18 +291,18 @@ class ToolRegistry:
             if any(_is_json_of(t, structured) for t in texts) or set(structured) != {"result"}:
                 # A genuine object result (the text is its rendering, or prose).
                 notes = [t for t in texts if not _is_json_of(t, structured)]
-                return _attach_notes(dict(structured), notes)
+                return _attach_notes(dict(structured), notes + omitted)
             # FastMCP wraps non-object returns as {"result": value}; unwrap it.
             value = structured["result"]
             notes = [t for t in texts if t != value and not _is_json_of(t, value)]
             if isinstance(value, str):
                 value = _json_or_text(value)
-            return _attach_notes(value, notes)
+            return _attach_notes(value, notes + omitted)
 
         if not texts:
-            return None
+            return {"data": None, "_notes": omitted} if omitted else None
         if len(texts) == 1:
-            return _json_or_text(texts[0])
+            return _attach_notes(_json_or_text(texts[0]), omitted)
 
         parsed, notes = [], []
         for t in texts:
@@ -299,8 +311,8 @@ class ToolRegistry:
             except (json.JSONDecodeError, TypeError):
                 notes.append(t)
         if len(parsed) == 1 and notes:
-            return _attach_notes(parsed[0], notes)
-        return _json_or_text("\n".join(texts))
+            return _attach_notes(parsed[0], notes + omitted)
+        return _attach_notes(_json_or_text("\n".join(texts)), omitted)
 
     def get_namespace(self) -> dict[str, Callable[..., Any]]:
         """Return tool namespace dict for injection into a script."""
@@ -377,6 +389,31 @@ class ToolRegistry:
     async def shutdown(self) -> None:
         """Stop every server supervisor (closing its connection)."""
         await asyncio.gather(*(c.stop() for c in self._connections.values()))
+
+
+def _is_transport_failure(e: BaseException) -> bool:
+    """True for errors that mean the connection itself is gone (so reconnecting helps)."""
+    return isinstance(e, (
+        anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream,
+        ConnectionError, EOFError, OSError,
+    )) or (isinstance(e, RuntimeError) and "async context manager" in str(e))
+
+
+def _is_schema_mismatch(e: BaseException) -> bool:
+    """The SDK client's outputSchema validation failures (raised as RuntimeError)."""
+    msg = str(e)
+    return isinstance(e, RuntimeError) and (
+        "Invalid structured content returned by tool" in msg
+        or "has an output schema but did not return structured content" in msg
+        or "Invalid schema for tool" in msg
+    )
+
+
+def _describe_non_text(content: Any) -> str:
+    kind = getattr(content, "type", type(content).__name__)
+    mime = getattr(content, "mime_type", None) or getattr(
+        getattr(content, "resource", None), "mime_type", None)
+    return f"[non-text content omitted: {kind}{f' ({mime})' if mime else ''}]"
 
 
 def _is_json_of(text: str, value: Any) -> bool:
